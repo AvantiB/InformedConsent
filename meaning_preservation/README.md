@@ -58,14 +58,33 @@ python meaning_preservation/run_classifier_experiments.py \
 
 ## Optional embedding features
 
+The script now supports two embedding backends:
+
+- `sentence_transformers`: uses `sentence-transformers` directly;
+- `hf`: uses plain Hugging Face `transformers` with mean pooling;
+- `auto`: tries `sentence-transformers` first, then falls back to `hf`.
+
+On the HPC, if `sentence-transformers` fails with an import error such as `AutoProcessor`, use the HF backend explicitly:
+
 ```bash
 python meaning_preservation/run_classifier_experiments.py \
-  --roundtrips_csv /path/to/step1_output/roundtrips.csv \
-  --output_dir meaning_preservation/outputs/with_embeddings \
-  --embedding_model sentence-transformers/all-MiniLM-L6-v2
+  --roundtrips_csv /path/to/roundtrips.csv \
+  --output_dir meaning_preservation/outputs/with_embeddings_hf \
+  --embedding_model all-MiniLM-L6-v2 \
+  --embedding_backend hf \
+  --embedding_device cuda
 ```
 
-Use a local cached model path on HPC if the compute nodes do not have internet access.
+The shorthand `all-MiniLM-L6-v2` is automatically resolved to `sentence-transformers/all-MiniLM-L6-v2` unless it is a local path. If compute nodes do not have internet access, pass a local cached model path:
+
+```bash
+python meaning_preservation/run_classifier_experiments.py \
+  --roundtrips_csv /path/to/roundtrips.csv \
+  --output_dir meaning_preservation/outputs/with_embeddings_hf \
+  --embedding_model /path/to/local/all-MiniLM-L6-v2 \
+  --embedding_backend hf \
+  --embedding_device cuda
+```
 
 ## Optional NLI features
 
