@@ -4,10 +4,13 @@ scipy>=1.10
 scikit-learn>=1.3
 matplotlib>=3.7
 joblib>=1.3
-# Optional semantic features
-sentence-transformers>=2.6
-transformers>=4.40
-torch>=2.1
-# Optional progress/report helpers
-tqdm>=4.66
 tabulate>=0.9
+tqdm>=4.66
+
+# Optional semantic features. Install/use these only when running
+# --embedding_model or --nli_model. The script can compute embeddings via
+# plain Hugging Face transformers mean pooling, so sentence-transformers is
+# useful but not required.
+torch>=2.1
+transformers>=4.40
+sentence-transformers>=2.6
