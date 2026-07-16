@@ -2,9 +2,22 @@
 
 This folder contains the reduced consent/data-use meta-model development workflow.
 
-The goal is not to manually design a new ontology. The goal is to induce a reduced, functional meta-model from evidence produced by the existing information models and round-trip data.
+The goal is not to manually design a new ontology. The goal is to induce a reduced, functional meta-model from evidence produced by existing information models and round-trip data.
 
-## Core idea
+## Starting point: Union V0
+
+The first baseline is **Union V0**: the unreduced union of source elements from ICO, DUO, FHIR Consent, and ODRL.
+
+Union V0 is intentionally bulky. It is used as the maximal evidence inventory from which redundancy, missing concepts, and meaning-critical distinctions can be discovered.
+
+Because the original per-model round-trip prompts used each information model's full data dictionary, the original individual-model results should remain the primary replication/reference baseline. For the combined union model, there are two possible conditions:
+
+1. **Union V0 full dictionary**: include all combined elements in one prompt if token budget allows.
+2. **Union V0 retrieval-augmented dictionary**: store the full union externally, retrieve top candidate element cards per sentence, and prompt only those candidates.
+
+These are different experimental conditions and should be reported separately.
+
+## Core evidence-unit idea
 
 Each round-trip example is converted into evidence units:
 
@@ -29,6 +42,39 @@ The reduced meta-model is then inferred from:
 Human involvement should be limited to audit, naming, and interpretation of induced clusters, not manual construction of the schema.
 
 ## Current scripts
+
+### 0a. Build Union V0 inventory
+
+```bash
+python meta_model/scripts/00_build_union_v0_inventory.py \
+  --prompt_dir /path/to/source_model_forward_prompts \
+  --output_dir meta_model/v0_union
+```
+
+Outputs:
+
+```text
+source_element_inventory.csv
+element_cards.jsonl
+source_model_prompt_sizes.csv
+```
+
+### 0b. Retrieve Union V0 candidates per sentence
+
+```bash
+python meta_model/scripts/00_retrieve_union_v0_candidates.py \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv \
+  --sentences_csv /path/to/roundtrips.csv \
+  --output_csv meta_model/v0_union/sentence_candidate_elements.csv \
+  --top_k 40
+```
+
+Outputs:
+
+```text
+sentence_candidate_elements.csv
+retrieval_summary.csv
+```
 
 ### 1. Build evidence units
 
@@ -76,8 +122,13 @@ Candidate meta-model units should be retained when they are frequent, cross-mode
 
 ## Next planned steps
 
-1. Generate evidence units from the existing round-trip CSV.
-2. Inspect extraction audit and cluster summaries.
-3. Add preservation-aware merge/split recommendation script.
-4. Generate induced meta-model v0.1 from cluster evidence.
-5. Evaluate v0.1 through forward/backward round-trip reconstruction.
+1. Collect the original ICO, DUO, FHIR Consent, and ODRL forward prompts into one folder.
+2. Build the Union V0 source-element inventory.
+3. Measure full Union V0 prompt size and decide whether a full-union prompt is feasible.
+4. Retrieve Union V0 candidates for each sentence.
+5. Evaluate candidate recall against historical forward mappings.
+6. Generate evidence units from the existing round-trip CSV.
+7. Cluster evidence units and inspect cluster summaries.
+8. Add preservation-aware merge/split/add recommendation script.
+9. Generate induced meta-model v0.1 from cluster evidence.
+10. Evaluate v0.1 through forward/backward round-trip reconstruction.
