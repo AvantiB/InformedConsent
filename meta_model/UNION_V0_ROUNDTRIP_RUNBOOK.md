@@ -2,7 +2,9 @@
 
 This runbook describes how to run the Union V0 baseline with one LLM deployed at a time. Union V0 is the unreduced combined inventory of ICO, DUO, FHIR Consent, and ODRL source-model elements.
 
-## Files added for this phase
+Do not commit local absolute paths, user names, API keys, private endpoints, or cluster-specific directories. Use environment variables or local config files for anything machine-specific.
+
+## Files for this phase
 
 ```text
 meta_model/configs/union_v0_models_template.yaml
@@ -11,23 +13,49 @@ meta_model/scripts/03_run_union_v0_roundtrip.py
 
 The runner uses the full Union V0 dictionary in the prompt, performs forward mapping and backward reconstruction, and writes append-only JSONL outputs so interrupted runs can resume.
 
-## 0. Pull and install dependencies
+## Method note: overlap-aware Union V0 mapping
 
-```bash
-cd /dgx1data/aii/tao/m338824/R03-InformedConsent/InformedConsent
+Union V0 is a naive union of multiple source information models. Because it is not reduced, the same or similar phrase may legitimately map to multiple elements. A broader phrase may also map to one source-model element while a nested phrase maps to a narrower element from another source model.
 
-git pull origin main
+The runner therefore asks the LLM to produce two layers:
 
-pip install openai pyyaml pandas
+```text
+raw annotations
+  - all clear span labels, including same-span, overlapping, and nested labels
+
+interpretation_units
+  - the LLM's decision about how related annotations should be considered together for backward reconstruction
 ```
 
-## 1. Rebuild Union V0 inventory if needed
+Backward reconstruction should use `interpretation_units` as the primary meaning-preserving layer, while preserving the raw annotation layer as evidence for redundancy, complementarity, broad/narrow nesting, and conflicts.
+
+## 0. Set local paths outside the repo
+
+Set paths in your shell or job script. Replace the placeholders with local paths on your machine or cluster.
+
+```bash
+export REPO_DIR=/path/to/InformedConsent
+export PROMPT_DIR=/path/to/source_model_prompts
+export ROUNDTRIPS_CSV=/path/to/roundtrips.csv
+
+cd "$REPO_DIR"
+```
+
+## 1. Pull and install dependencies
+
+```bash
+git pull origin main
+pip install -r meta_model/requirements.txt
+```
+
+## 2. Rebuild Union V0 inventory if needed
 
 ```bash
 python -m py_compile meta_model/scripts/00_build_union_v0_inventory.py
+python -m py_compile meta_model/scripts/03_run_union_v0_roundtrip.py
 
 python meta_model/scripts/00_build_union_v0_inventory.py \
-  --prompt_dir /dgx1data/aii/tao/m338824/R03-InformedConsent/source_model_prompts \
+  --prompt_dir "$PROMPT_DIR" \
   --output_dir meta_model/v0_union
 ```
 
@@ -53,7 +81,7 @@ FHIR_Consent: 18 span + 1 sentence_level
 Total: 99
 ```
 
-## 2. Create local model config
+## 3. Create local model config
 
 ```bash
 mkdir -p meta_model/configs
@@ -75,11 +103,11 @@ For GPT-5.5 through the OpenAI API:
 export OPENAI_API_KEY=YOUR_KEY_HERE
 ```
 
-## 3. Smoke test one model at a time
+## 4. Smoke test one model at a time
 
-Use one terminal for the vLLM server and another for the runner.
+Use one terminal/job for the vLLM server and another for the runner.
 
-### 3A. Start vLLM server for MedGemma
+### 4A. Start vLLM server for MedGemma
 
 Adjust the model path/name to your local model location.
 
@@ -93,11 +121,11 @@ python -m vllm.entrypoints.openai.api_server \
   --max-model-len 8192
 ```
 
-### 3B. Run a 20-sentence smoke test
+### 4B. Run a 20-sentence smoke test
 
 ```bash
 python meta_model/scripts/03_run_union_v0_roundtrip.py \
-  --roundtrips_csv /dgx1data/aii/tao/m338824/R03-InformedConsent/roundtrips.csv \
+  --roundtrips_csv "$ROUNDTRIPS_CSV" \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key medgemma \
@@ -113,20 +141,20 @@ head -n 2 meta_model/outputs/union_v0_roundtrip_smoke/medgemma/union_v0_forward_
 head -n 2 meta_model/outputs/union_v0_roundtrip_smoke/medgemma/union_v0_backward_reconstructions.jsonl
 ```
 
-If JSON parsing looks good, proceed to the full run for that model.
+If JSON parsing and `interpretation_units` look good, proceed to the full run for that model.
 
-## 4. Full run for one deployed open-source model
+## 5. Full run for one deployed open-source model
 
 ```bash
 python meta_model/scripts/03_run_union_v0_roundtrip.py \
-  --roundtrips_csv /dgx1data/aii/tao/m338824/R03-InformedConsent/roundtrips.csv \
+  --roundtrips_csv "$ROUNDTRIPS_CSV" \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key medgemma \
   --output_dir meta_model/outputs/union_v0_roundtrip
 ```
 
-The runner deduplicates repeated source sentences by default. With the current round-trip dataset this should run the unique consent sentences rather than all prior model/source-model rows. To run every row, add:
+The runner deduplicates repeated source sentences by default. To run every row, add:
 
 ```bash
 --no_dedupe_sentences
@@ -145,7 +173,7 @@ meta_model/outputs/union_v0_roundtrip/<model_key>/
 
 The JSONL files are append-only. If the job stops, rerun the same command and completed `source_id`s will be skipped.
 
-## 5. Stop server, deploy the next model, rerun with the next key
+## 6. Stop server, deploy the next model, rerun with the next key
 
 Stop the current vLLM server, then start the next model using the same port and matching served model name.
 
@@ -163,7 +191,7 @@ python -m vllm.entrypoints.openai.api_server \
 
 ```bash
 python meta_model/scripts/03_run_union_v0_roundtrip.py \
-  --roundtrips_csv /dgx1data/aii/tao/m338824/R03-InformedConsent/roundtrips.csv \
+  --roundtrips_csv "$ROUNDTRIPS_CSV" \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key qwen235b \
@@ -184,14 +212,14 @@ python -m vllm.entrypoints.openai.api_server \
 
 ```bash
 python meta_model/scripts/03_run_union_v0_roundtrip.py \
-  --roundtrips_csv /dgx1data/aii/tao/m338824/R03-InformedConsent/roundtrips.csv \
+  --roundtrips_csv "$ROUNDTRIPS_CSV" \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key llama4_scout \
   --output_dir meta_model/outputs/union_v0_roundtrip
 ```
 
-## 6. GPT-5.5 run
+## 7. GPT-5.5 run
 
 No vLLM server is needed for this condition.
 
@@ -199,14 +227,26 @@ No vLLM server is needed for this condition.
 export OPENAI_API_KEY=YOUR_KEY_HERE
 
 python meta_model/scripts/03_run_union_v0_roundtrip.py \
-  --roundtrips_csv /dgx1data/aii/tao/m338824/R03-InformedConsent/roundtrips.csv \
+  --roundtrips_csv "$ROUNDTRIPS_CSV" \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key gpt55 \
   --output_dir meta_model/outputs/union_v0_roundtrip
 ```
 
-## 7. After all four runs
+## 8. Individual-model replication with the new LLMs
+
+Because the LLM panel changes relative to the original researchers' experiments, the clean design is:
+
+```text
+A. New LLMs + original individual-model prompts
+B. New LLMs + Union V0 full-dictionary prompt
+C. New LLMs + reduced meta-model prompt, later
+```
+
+Condition A is needed to separate the effect of the LLM from the effect of the information model. Union V0 should not be compared only to historical outputs from different LLMs.
+
+## 9. After all four Union V0 runs
 
 Archive or upload:
 
@@ -214,4 +254,4 @@ Archive or upload:
 meta_model/outputs/union_v0_roundtrip/
 ```
 
-The next analysis step will score the Union V0 reconstructions with the meaning-preservation classifier and use the forward mappings to build the evidence graph for data/language-driven reduction.
+The next analysis step will score the Union V0 reconstructions with the meaning-preservation classifier and use both raw annotations and interpretation units to build the evidence graph for data/language-driven reduction.
