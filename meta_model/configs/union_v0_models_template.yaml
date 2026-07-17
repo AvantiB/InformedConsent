@@ -1,6 +1,11 @@
 # Copy this file to union_v0_models.local.yaml and edit endpoints/model names.
 # Do not commit API keys.
 
+# The open-source models are intended to be run one at a time behind a vLLM
+# OpenAI-compatible server. You can reuse the same localhost port for each model:
+# stop the previous vLLM server, start the next one, then run the round-trip
+# script with the matching --model_key.
+
 defaults:
   api_type: chat_completions
   temperature: 0
@@ -19,4 +24,17 @@ models:
   qwen235b:
     provider: openai_compatible
     model: qwen235b
-    base_url: http://127.0.0.1
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: VLLM_API_KEY
+
+  llama4_scout:
+    provider: openai_compatible
+    model: meta-llama/Llama-4-Scout-17B-16E-Instruct
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: VLLM_API_KEY
+
+  gpt55:
+    provider: openai
+    model: gpt-5.5
+    base_url: null
+    api_key_env: OPENAI_API_KEY
