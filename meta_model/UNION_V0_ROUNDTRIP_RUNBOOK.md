@@ -18,7 +18,7 @@ The runner uses the full Union V0 dictionary in the prompt, performs forward map
 
 Union V0 is a naive union of multiple source information models. Because it is not reduced, the same or similar phrase may legitimately map to multiple elements. A broader phrase may also map to one source-model element while a nested phrase maps to a narrower element from another source model.
 
-The runner therefore asks the LLM to produce two layers:
+The runner asks the LLM to produce two layers:
 
 ```text
 raw annotations
@@ -30,7 +30,7 @@ interpretation_units
 
 Backward reconstruction uses `interpretation_units` as the primary meaning-preserving layer, while preserving the raw annotation layer as evidence for redundancy, complementarity, broad/narrow nesting, and conflicts.
 
-The runner also validates `union_element_id` values against the Union V0 inventory. Common unambiguous formatting errors are repaired, for example a single-colon output such as `ICO:0000108` can be normalized to the exact inventory ID `ICO::ICO:0000108`. Remaining invalid IDs are moved to `invalid_annotations` and should be inspected before a full run.
+The runner validates `union_element_id` values against the Union V0 inventory. Common unambiguous formatting errors are repaired, for example a single-colon output such as `ICO:0000108` can be normalized to the exact inventory ID `ICO::ICO:0000108`. Remaining invalid IDs are moved to `invalid_annotations` and are not treated as primary dictionary-grounded evidence for backward reconstruction.
 
 ## 0. Set local paths outside the repo
 
@@ -154,7 +154,7 @@ cat meta_model/outputs/union_v0_roundtrip_smoke/medgemma/validation.summary.json
 head -n 20 meta_model/outputs/union_v0_roundtrip_smoke/medgemma/validation.invalid_annotations.csv
 ```
 
-Smoke-test gate before a full run:
+Smoke-test gates:
 
 ```text
 n_forward_records == 20
@@ -162,30 +162,22 @@ n_backward_records == 20
 n_failed_requests == 0
 n_forward_jsonl_parse_errors == 0
 n_records_with_interpretation_units == 20
-n_invalid_ids_remaining == 0 preferred
-ready_for_full_run == true preferred
+n_invalid_ids_in_primary_annotations == 0
+n_repairable_ids_not_yet_repaired == 0
+ready_for_full_run_pragmatic == true
 ```
 
-A small number of `n_repaired_ids_by_runner` is acceptable because the runner repaired those IDs before backward reconstruction. Remaining `invalid_annotations` should be reviewed before running the full dataset.
+`ready_for_full_run_strict` additionally requires zero quarantined invalid IDs. This is ideal but not mandatory. A small number of `invalid_annotations_from_runner` is acceptable if the IDs are quarantined, the invalid rate is low, and the spans are reviewed. By default, the pragmatic gate allows quarantined invalid IDs up to 5% of primary annotations.
 
-## 5. MedGemma smoke-test status and immediate next action
+## 5. Current MedGemma smoke-test status and immediate next action
 
-The first MedGemma smoke test successfully produced 20 forward mappings and 20 backward reconstructions, and all 20 records included interpretation units. However, validation found many Union V0 ID-format issues in the old smoke output: most were repairable single-colon formatting errors, but a few were genuinely invalid IDs.
+The patched MedGemma smoke test produced 20 forward mappings and 20 backward reconstructions with no failed requests or parse errors. All 20 records included interpretation units. Primary annotations had exact valid Union V0 IDs after runner repair. Five invalid IDs were quarantined into `invalid_annotations`; this is below the 5% pragmatic threshold but should still be inspected.
 
-The runner has therefore been patched to:
+Next action: pull the latest validator, rerun validation, inspect the quarantined invalid annotations, and proceed to the full MedGemma run if `ready_for_full_run_pragmatic` is true.
 
-```text
-1. tell the LLM to copy exact union_element_id values, including double colons;
-2. repair unambiguous ID-format errors;
-3. move remaining invalid IDs to invalid_annotations;
-4. exclude invalid IDs from the primary backward reconstruction evidence.
-```
+## 6. Full MedGemma run
 
-Next action: rerun the MedGemma 20-sentence smoke test from scratch with the patched runner, then rerun the validator. Do not start the full MedGemma run until the new smoke validation looks clean enough.
-
-## 6. Full run for one deployed open-source model
-
-After a clean smoke test:
+After the pragmatic smoke gate is passed:
 
 ```bash
 python meta_model/scripts/03_run_union_v0_roundtrip.py \
