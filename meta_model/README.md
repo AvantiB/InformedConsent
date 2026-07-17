@@ -15,7 +15,7 @@ Because the original per-model round-trip prompts used each information model's 
 1. **Union V0 full dictionary**: include all combined elements in one prompt if token budget allows.
 2. **Union V0 retrieval-augmented dictionary**: store the full union externally, retrieve top candidate element cards per sentence, and prompt only those candidates.
 
-These are different experimental conditions and should be reported separately.
+These are different experimental conditions and should be reported separately. With the current prompt files, Union V0 is small enough to run the full-dictionary condition first.
 
 ## Core evidence-unit idea
 
@@ -57,6 +57,7 @@ Outputs:
 source_element_inventory.csv
 element_cards.jsonl
 source_model_prompt_sizes.csv
+parse_audit.csv
 ```
 
 ### 0b. Retrieve Union V0 candidates per sentence
@@ -74,6 +75,39 @@ Outputs:
 ```text
 sentence_candidate_elements.csv
 retrieval_summary.csv
+```
+
+### 0c. Run Union V0 full-dictionary round trip
+
+```bash
+python meta_model/scripts/03_run_union_v0_roundtrip.py \
+  --roundtrips_csv /path/to/roundtrips.csv \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv \
+  --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
+  --model_key medgemma \
+  --output_dir meta_model/outputs/union_v0_roundtrip
+```
+
+The runner is designed for one deployed model at a time. It supports vLLM OpenAI-compatible endpoints and OpenAI API models through the same config template:
+
+```text
+meta_model/configs/union_v0_models_template.yaml
+```
+
+Outputs per model:
+
+```text
+run_metadata.json
+union_v0_forward_mappings.jsonl
+union_v0_backward_reconstructions.jsonl
+union_v0_roundtrip_outputs.csv
+failed_requests.jsonl
+```
+
+See the full runbook:
+
+```text
+meta_model/UNION_V0_ROUNDTRIP_RUNBOOK.md
 ```
 
 ### 1. Build evidence units
@@ -122,13 +156,10 @@ Candidate meta-model units should be retained when they are frequent, cross-mode
 
 ## Next planned steps
 
-1. Collect the original ICO, DUO, FHIR Consent, and ODRL forward prompts into one folder.
-2. Build the Union V0 source-element inventory.
-3. Measure full Union V0 prompt size and decide whether a full-union prompt is feasible.
-4. Retrieve Union V0 candidates for each sentence.
-5. Evaluate candidate recall against historical forward mappings.
-6. Generate evidence units from the existing round-trip CSV.
-7. Cluster evidence units and inspect cluster summaries.
-8. Add preservation-aware merge/split/add recommendation script.
-9. Generate induced meta-model v0.1 from cluster evidence.
-10. Evaluate v0.1 through forward/backward round-trip reconstruction.
+1. Run Union V0 full-dictionary round trips for each LLM, one model at a time.
+2. Score Union V0 reconstructions with the meaning-preservation classifier.
+3. Generate evidence units from Union V0 plus the existing historical round-trip CSV.
+4. Cluster evidence units and inspect cluster summaries.
+5. Add preservation-aware merge/split/add recommendation script.
+6. Generate induced meta-model v0.1 from cluster evidence.
+7. Evaluate v0.1 through the same forward/backward round-trip setup.
