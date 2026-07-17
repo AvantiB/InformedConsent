@@ -3,9 +3,12 @@
 
 Replication condition: new LLMs + original individual source-model prompts.
 
-The forward step uses the original source-model forward prompt text. The
-backward step uses a matching backward prompt if supplied; otherwise it uses a
-generic reconstruction prompt that does not see the original sentence.
+The forward step uses the original source-model forward prompt text. The backward
+step uses a matching backward prompt if supplied; otherwise it uses a generic
+reconstruction prompt. Backward mapping never receives the original sentence; it
+receives only sanitized forward output with exact original-sentence echoes masked.
+If the forward output is JSON-like, annotation-like lists are ordered by the
+position of their span text in the original sentence before reconstruction.
 
 Outputs are append-only JSONL files and are safe to resume.
 """
@@ -38,6 +41,8 @@ TEXT_COL_CANDIDATES = ["canonical_full_text", "full_text_original", "original_se
 ID_COL_CANDIDATES = ["sentence_id", "source_sentence_id", "roundtrip_id", "id"]
 INFO_MODELS = ["DUO", "ICO", "ODRL", "FHIR_Consent"]
 PROMPT_PATTERNS = {"DUO": [r"duo"], "ICO": [r"ico"], "ODRL": [r"odrl"], "FHIR_Consent": [r"fhir", r"r03_fhir"]}
+SPAN_KEYS = ["span_text", "evidence_span_text", "evidence_text", "text_span", "phrase", "text"]
+MASK = "[ORIGINAL_SENTENCE_REMOVED]"
 
 
 def norm_text(x: Any) -> str:
@@ -79,7 +84,7 @@ def load_rows(roundtrips_csv: Path, limit: int | None, no_dedupe_sentences: bool
 
 def load_model_config(path: Path, model_key: str) -> dict[str, Any]:
     cfg = yaml.safe_load(path.read_text())
-    model_cfg = {**(cfg.get("defaults", {}) or {}), **(cfg.get("models", {}) or {}).get(model_key, {})}
+    model_cfg = {**(cfg.get("defaults", {}) or {}), **((cfg.get("models", {}) or {}).get(model_key, {}))}
     if not model_cfg:
         raise KeyError(f"model_key={model_key!r} not found in {path}")
     model_cfg["model_key"] = model_key
@@ -98,7 +103,7 @@ def make_client(model_cfg: dict[str, Any]) -> OpenAI:
 
 
 def call_chat(client: OpenAI, model_cfg: dict[str, Any], messages: list[dict[str, str]]) -> str:
-    kwargs: dict[str, Any] = {
+    kwargs = {
         "model": model_cfg["model"],
         "messages": messages,
         "max_tokens": int(model_cfg.get("max_tokens", 4096)),
@@ -108,7 +113,7 @@ def call_chat(client: OpenAI, model_cfg: dict[str, Any], messages: list[dict[str
         kwargs["temperature"] = model_cfg.get("temperature", 0)
     max_retries = int(model_cfg.get("max_retries", 3))
     retry_sleep = float(model_cfg.get("retry_sleep_seconds", 5))
-    last_exc: Exception | None = None
+    last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
             resp = client.chat.completions.create(**kwargs)
@@ -121,79 +126,195 @@ def call_chat(client: OpenAI, model_cfg: dict[str, Any], messages: list[dict[str
 
 
 def find_prompt_file(prompt_dir: Path, info_model: str) -> Path:
+    patterns = PROMPT_PATTERNS[info_model]
     files = [p for p in prompt_dir.iterdir() if p.is_file() and p.suffix.lower() in {".txt", ".md"}]
-    pats = PROMPT_PATTERNS[info_model]
     matches = []
     for p in files:
         name = p.name.lower()
-        if any(re.search(pat, name) for pat in pats) and "forward" in name:
+        if any(re.search(pattern, name) for pattern in patterns):
             matches.append(p)
     if not matches:
-        for p in files:
-            name = p.name.lower()
-            if any(re.search(pat, name) for pat in pats):
-                matches.append(p)
-    if not matches:
-        raise FileNotFoundError(f"No prompt file found for {info_model} in {prompt_dir}")
-    return sorted(matches, key=lambda x: len(x.name))[0]
+        raise FileNotFoundError(f"Could not find prompt file for {info_model} in {prompt_dir}")
+    matches = sorted(matches, key=lambda p: ("forward" not in p.name.lower(), len(p.name), p.name.lower()))
+    return matches[0]
 
 
-def find_backward_prompt_file(prompt_dir: Path | None, info_model: str) -> Path | None:
-    if prompt_dir is None or not prompt_dir.exists():
+def find_backward_prompt_file(backward_dir: Path | None, info_model: str) -> Path | None:
+    if backward_dir is None or not backward_dir.exists():
         return None
-    files = [p for p in prompt_dir.iterdir() if p.is_file() and p.suffix.lower() in {".txt", ".md"}]
-    pats = PROMPT_PATTERNS[info_model]
+    patterns = PROMPT_PATTERNS[info_model]
+    files = [p for p in backward_dir.iterdir() if p.is_file() and p.suffix.lower() in {".txt", ".md"}]
     matches = []
     for p in files:
         name = p.name.lower()
-        if any(re.search(pat, name) for pat in pats) and ("backward" in name or "reconstruct" in name):
+        if any(re.search(pattern, name) for pattern in patterns):
             matches.append(p)
-    return sorted(matches, key=lambda x: len(x.name))[0] if matches else None
+    if not matches:
+        return None
+    matches = sorted(matches, key=lambda p: ("back" not in p.name.lower(), len(p.name), p.name.lower()))
+    return matches[0]
 
 
 def build_forward_messages(prompt_text: str, sentence: str) -> list[dict[str, str]]:
-    system = "You are an NLP annotator for informed-consent documents. Follow the provided data dictionary prompt exactly."
-    user = f"""{prompt_text.strip()}
+    system = "You are an NLP annotator for informed-consent documents. Return only the requested output format."
+    user = f"""
+Use the following original source-model prompt to annotate the sentence.
 
-Now apply the above prompt to this sentence.
+Original source-model prompt:
+{prompt_text}
 
-Sentence:
+Sentence to annotate:
 {sentence}
-
-Return only the annotation output requested by the prompt."""
+""".strip()
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def build_backward_messages(info_model: str, forward_output: str, backward_prompt_text: str | None) -> list[dict[str, str]]:
-    system = "You reconstruct informed-consent sentence meaning from structured annotations. Do not see the original sentence."
+def extract_json(text: str) -> Any:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        return json.loads(stripped)
+    except Exception:
+        start_obj = stripped.find("{")
+        end_obj = stripped.rfind("}")
+        start_arr = stripped.find("[")
+        end_arr = stripped.rfind("]")
+        candidates = []
+        if start_obj >= 0 and end_obj > start_obj:
+            candidates.append(stripped[start_obj : end_obj + 1])
+        if start_arr >= 0 and end_arr > start_arr:
+            candidates.append(stripped[start_arr : end_arr + 1])
+        for cand in candidates:
+            try:
+                return json.loads(cand)
+            except Exception:
+                pass
+    raise ValueError("Could not parse JSON from forward output")
+
+
+def mask_original_sentence_in_text(text: Any, source_text: str) -> Any:
+    if not isinstance(text, str) or not source_text:
+        return text
+    out = text
+    for variant in {source_text, norm_text(source_text)}:
+        if variant:
+            out = re.sub(re.escape(variant), MASK, out, flags=re.IGNORECASE)
+    return out
+
+
+def find_span_bounds(sentence: str, span: Any) -> tuple[int | None, int | None]:
+    if not isinstance(span, str) or not span.strip():
+        return None, None
+    span_norm = " ".join(span.split())
+    idx = sentence.lower().find(span_norm.lower())
+    if idx >= 0:
+        return idx, idx + len(span_norm)
+    pattern = r"\s+".join(re.escape(part) for part in span_norm.split())
+    match = re.search(pattern, sentence, flags=re.IGNORECASE)
+    if match:
+        return match.start(), match.end()
+    return None, None
+
+
+def get_span_value(d: dict[str, Any]) -> str:
+    for key in SPAN_KEYS:
+        value = d.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def order_annotation_like_list(items: list[Any], source_text: str) -> list[Any]:
+    if not all(isinstance(x, dict) for x in items):
+        return items
+    if not any(get_span_value(x) for x in items if isinstance(x, dict)):
+        return items
+    ordered = []
+    for item in items:
+        item2 = dict(item)
+        span = get_span_value(item2)
+        start, end = find_span_bounds(source_text, span)
+        item2["span_start"] = start
+        item2["span_end"] = end
+        ordered.append(item2)
+
+    def sort_key(item: dict[str, Any]) -> tuple[int, int]:
+        start = item.get("span_start")
+        end = item.get("span_end")
+        if start is None:
+            start = 10**9
+        if end is None:
+            end = start
+        return int(start), -int(end - start)
+
+    ordered = sorted(ordered, key=sort_key)
+    for i, item in enumerate(ordered, start=1):
+        item["sentence_order_index"] = i
+    return ordered
+
+
+def sanitize_json_like_obj(obj: Any, source_text: str) -> Any:
+    if isinstance(obj, str):
+        return mask_original_sentence_in_text(obj, source_text)
+    if isinstance(obj, list):
+        cleaned = [sanitize_json_like_obj(x, source_text) for x in obj]
+        return order_annotation_like_list(cleaned, source_text)
+    if isinstance(obj, dict):
+        return {k: sanitize_json_like_obj(v, source_text) for k, v in obj.items()}
+    return obj
+
+
+def build_sanitized_forward_material(raw_forward: str, source_text: str) -> dict[str, Any]:
+    """Build the only forward-derived object allowed in the backward prompt."""
+    try:
+        parsed = extract_json(raw_forward)
+        sanitized = sanitize_json_like_obj(parsed, source_text)
+        return {
+            "forward_output_format": "json_like",
+            "sanitized_forward_output": sanitized,
+            "sanitization_note": (
+                "Original full sentence was removed if echoed. Annotation-like lists were sorted by span position when possible."
+            ),
+        }
+    except Exception:
+        sanitized_text = mask_original_sentence_in_text(raw_forward, source_text)
+        return {
+            "forward_output_format": "raw_text_sanitized",
+            "sanitized_forward_output": sanitized_text,
+            "sanitization_note": "Original full sentence was removed if echoed. Raw text could not be parsed as JSON for ordering.",
+        }
+
+
+def build_backward_messages(info_model: str, sanitized_material: dict[str, Any], backward_prompt_text: str | None) -> list[dict[str, str]]:
+    system = (
+        "You reconstruct informed-consent sentence meaning from a sanitized forward mapping. "
+        "You do not see the original sentence. Return only the requested reconstruction."
+    )
+    material_text = json.dumps(sanitized_material, ensure_ascii=False, indent=2)
     if backward_prompt_text:
-        user = f"""{backward_prompt_text.strip()}
-
-Use this forward mapping as input. Do not use the original sentence.
-
-Forward mapping:
-{forward_output}
-
-Return the reconstructed sentence only, unless the prompt requires a specific output format."""
+        instructions = f"Original backward prompt/instructions:\n{backward_prompt_text}"
     else:
-        user = f"""Task: reconstruct a concise natural-language informed-consent sentence from the {info_model} forward mapping below.
-
-Rules:
+        instructions = f"""
+Generic backward reconstruction instructions for {info_model}:
+- Reconstruct one concise natural-language consent sentence that preserves the meaning of the sanitized forward mapping.
 - Do not add details that are not present in the mapping.
-- Preserve permission/denial, action, data/specimen object, actor/recipient, purpose, condition, restriction, and temporal meaning when present.
-- Do not see or infer from the original sentence.
-- Return valid JSON only with this structure:
-{{"reconstructed_sentence": "...", "reconstruction_notes": "brief note or empty string"}}
+- Do not ask for or assume access to the original sentence.
+- If annotation-like items include sentence_order_index, use that order as the main reconstruction order.
+- Preserve permission/denial, action, object, actor/recipient, purpose, condition, restriction, and temporal meaning when present.
+""".strip()
+    user = f"""
+{instructions}
 
-Forward mapping:
-{forward_output}"""
+Critical leakage rule:
+- The original sentence is intentionally not provided.
+- Use only the sanitized forward mapping below.
+
+Sanitized forward mapping:
+{material_text}
+""".strip()
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-
-def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
-    with path.open("a") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        f.flush()
 
 
 def read_done(path: Path) -> set[str]:
@@ -206,10 +327,17 @@ def read_done(path: Path) -> set[str]:
                 continue
             try:
                 obj = json.loads(line)
-                done.add(str(obj["source_id"]))
+                done.add(str(obj.get("source_id")))
             except Exception:
-                continue
+                pass
     return done
+
+
+def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()
 
 
 def load_jsonl_by_id(path: Path) -> dict[str, dict[str, Any]]:
@@ -226,22 +354,32 @@ def load_jsonl_by_id(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
-    forward = load_jsonl_by_id(forward_path)
-    backward = load_jsonl_by_id(backward_path)
+    fwd = load_jsonl_by_id(forward_path)
+    bwd = load_jsonl_by_id(backward_path)
     rows = []
-    for source_id, fwd in forward.items():
-        bwd = backward.get(source_id, {})
+    for source_id, f in fwd.items():
+        b = bwd.get(source_id, {})
         rows.append({
             "source_id": source_id,
-            "source_text": fwd.get("source_text", ""),
-            "info_model": fwd.get("info_model", ""),
-            "forward_raw": fwd.get("raw_response", ""),
-            "backward_raw": bwd.get("raw_response", ""),
+            "source_text": f.get("source_text", ""),
+            "forward_raw": f.get("raw_response", ""),
+            "backward_raw": b.get("raw_response", ""),
+            "backward_input_sanitized": b.get("backward_input_sanitized", False),
+            "sanitized_forward_material_json": json.dumps(b.get("sanitized_forward_material", {}), ensure_ascii=False),
         })
     pd.DataFrame(rows).to_csv(out_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 
 
-def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], info_model: str, prompt_text: str, backward_prompt_text: str | None, out_dir: Path, stage: str) -> None:
+def run_info_model(
+    rows: pd.DataFrame,
+    client: OpenAI,
+    model_cfg: dict[str, Any],
+    info_model: str,
+    prompt_text: str,
+    backward_prompt_text: str | None,
+    out_dir: Path,
+    stage: str,
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     forward_path = out_dir / "forward_mappings.jsonl"
     backward_path = out_dir / "backward_reconstructions.jsonl"
@@ -278,14 +416,18 @@ def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any]
             if source_id in done:
                 continue
             try:
-                raw = call_chat(client, model_cfg, build_backward_messages(info_model, fwd.get("raw_response", ""), backward_prompt_text))
+                source_text = fwd.get("source_text", "")
+                sanitized_material = build_sanitized_forward_material(fwd.get("raw_response", ""), source_text)
+                raw = call_chat(client, model_cfg, build_backward_messages(info_model, sanitized_material, backward_prompt_text))
                 append_jsonl(backward_path, {
                     "source_id": source_id,
-                    "source_text": fwd.get("source_text", ""),
+                    "source_text": source_text,
                     "model_key": model_cfg["model_key"],
                     "model": model_cfg["model"],
                     "info_model": info_model,
                     "stage": "backward",
+                    "backward_input_sanitized": True,
+                    "sanitized_forward_material": sanitized_material,
                     "raw_response": raw,
                 })
                 done.add(source_id)
@@ -333,6 +475,7 @@ def main() -> None:
         "prompt_dir": args.prompt_dir,
         "backward_prompt_dir": args.backward_prompt_dir,
         "stage": args.stage,
+        "backward_input": "sanitized_forward_output_no_original_sentence_exact_sentence_echoes_masked_annotation_like_lists_ordered_when_parseable",
     }, indent=2))
 
     for info_model in info_models:
@@ -341,11 +484,12 @@ def main() -> None:
         prompt_text = prompt_path.read_text(errors="replace")
         backward_text = backward_path.read_text(errors="replace") if backward_path else None
         out_dir = base_out / info_model
-        (out_dir / "prompt_files.json").parent.mkdir(parents=True, exist_ok=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "prompt_files.json").write_text(json.dumps({
             "forward_prompt_file": str(prompt_path),
             "backward_prompt_file": str(backward_path) if backward_path else None,
             "uses_generic_backward_prompt": backward_path is None,
+            "backward_input_sanitized": True,
         }, indent=2))
         run_info_model(rows, client, model_cfg, info_model, prompt_text, backward_text, out_dir, args.stage)
 
