@@ -9,6 +9,7 @@ Do not commit local absolute paths, user names, API keys, private endpoints, or 
 ```text
 meta_model/configs/union_v0_models_template.yaml
 meta_model/scripts/03_run_union_v0_roundtrip.py
+meta_model/scripts/04_validate_union_v0_outputs.py
 ```
 
 The runner uses the full Union V0 dictionary in the prompt, performs forward mapping and backward reconstruction, and writes append-only JSONL outputs so interrupted runs can resume.
@@ -27,7 +28,9 @@ interpretation_units
   - the LLM's decision about how related annotations should be considered together for backward reconstruction
 ```
 
-Backward reconstruction should use `interpretation_units` as the primary meaning-preserving layer, while preserving the raw annotation layer as evidence for redundancy, complementarity, broad/narrow nesting, and conflicts.
+Backward reconstruction uses `interpretation_units` as the primary meaning-preserving layer, while preserving the raw annotation layer as evidence for redundancy, complementarity, broad/narrow nesting, and conflicts.
+
+The runner also validates `union_element_id` values against the Union V0 inventory. Common unambiguous formatting errors are repaired, for example a single-colon output such as `ICO:0000108` can be normalized to the exact inventory ID `ICO::ICO:0000108`. Remaining invalid IDs are moved to `invalid_annotations` and should be inspected before a full run.
 
 ## 0. Set local paths outside the repo
 
@@ -53,6 +56,7 @@ pip install -r meta_model/requirements.txt
 ```bash
 python -m py_compile meta_model/scripts/00_build_union_v0_inventory.py
 python -m py_compile meta_model/scripts/03_run_union_v0_roundtrip.py
+python -m py_compile meta_model/scripts/04_validate_union_v0_outputs.py
 
 python meta_model/scripts/00_build_union_v0_inventory.py \
   --prompt_dir "$PROMPT_DIR" \
@@ -124,6 +128,8 @@ python -m vllm.entrypoints.openai.api_server \
 ### 4B. Run a 20-sentence smoke test
 
 ```bash
+rm -rf meta_model/outputs/union_v0_roundtrip_smoke/medgemma
+
 python meta_model/scripts/03_run_union_v0_roundtrip.py \
   --roundtrips_csv "$ROUNDTRIPS_CSV" \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
@@ -133,17 +139,53 @@ python meta_model/scripts/03_run_union_v0_roundtrip.py \
   --limit 20
 ```
 
+### 4C. Validate the smoke test
+
+```bash
+python meta_model/scripts/04_validate_union_v0_outputs.py \
+  --model_output_dir meta_model/outputs/union_v0_roundtrip_smoke/medgemma \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv
+```
+
 Inspect:
 
 ```bash
-ls -lh meta_model/outputs/union_v0_roundtrip_smoke/medgemma
-head -n 2 meta_model/outputs/union_v0_roundtrip_smoke/medgemma/union_v0_forward_mappings.jsonl
-head -n 2 meta_model/outputs/union_v0_roundtrip_smoke/medgemma/union_v0_backward_reconstructions.jsonl
+cat meta_model/outputs/union_v0_roundtrip_smoke/medgemma/validation.summary.json
+head -n 20 meta_model/outputs/union_v0_roundtrip_smoke/medgemma/validation.invalid_annotations.csv
 ```
 
-If JSON parsing and `interpretation_units` look good, proceed to the full run for that model.
+Smoke-test gate before a full run:
 
-## 5. Full run for one deployed open-source model
+```text
+n_forward_records == 20
+n_backward_records == 20
+n_failed_requests == 0
+n_forward_jsonl_parse_errors == 0
+n_records_with_interpretation_units == 20
+n_invalid_ids_remaining == 0 preferred
+ready_for_full_run == true preferred
+```
+
+A small number of `n_repaired_ids_by_runner` is acceptable because the runner repaired those IDs before backward reconstruction. Remaining `invalid_annotations` should be reviewed before running the full dataset.
+
+## 5. MedGemma smoke-test status and immediate next action
+
+The first MedGemma smoke test successfully produced 20 forward mappings and 20 backward reconstructions, and all 20 records included interpretation units. However, validation found many Union V0 ID-format issues in the old smoke output: most were repairable single-colon formatting errors, but a few were genuinely invalid IDs.
+
+The runner has therefore been patched to:
+
+```text
+1. tell the LLM to copy exact union_element_id values, including double colons;
+2. repair unambiguous ID-format errors;
+3. move remaining invalid IDs to invalid_annotations;
+4. exclude invalid IDs from the primary backward reconstruction evidence.
+```
+
+Next action: rerun the MedGemma 20-sentence smoke test from scratch with the patched runner, then rerun the validator. Do not start the full MedGemma run until the new smoke validation looks clean enough.
+
+## 6. Full run for one deployed open-source model
+
+After a clean smoke test:
 
 ```bash
 python meta_model/scripts/03_run_union_v0_roundtrip.py \
@@ -154,7 +196,15 @@ python meta_model/scripts/03_run_union_v0_roundtrip.py \
   --output_dir meta_model/outputs/union_v0_roundtrip
 ```
 
-The runner deduplicates repeated source sentences by default. To run every row, add:
+Validate the full run:
+
+```bash
+python meta_model/scripts/04_validate_union_v0_outputs.py \
+  --model_output_dir meta_model/outputs/union_v0_roundtrip/medgemma \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv
+```
+
+The runner deduplicates repeated source sentences by default. To run every row rather than unique source sentences, add:
 
 ```bash
 --no_dedupe_sentences
@@ -169,11 +219,13 @@ meta_model/outputs/union_v0_roundtrip/<model_key>/
   union_v0_backward_reconstructions.jsonl
   union_v0_roundtrip_outputs.csv
   failed_requests.jsonl
+  validation.summary.json
+  validation.invalid_annotations.csv
 ```
 
 The JSONL files are append-only. If the job stops, rerun the same command and completed `source_id`s will be skipped.
 
-## 6. Stop server, deploy the next model, rerun with the next key
+## 7. Stop server, deploy the next open-source model, rerun with the next key
 
 Stop the current vLLM server, then start the next model using the same port and matching served model name.
 
@@ -196,6 +248,10 @@ python meta_model/scripts/03_run_union_v0_roundtrip.py \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key qwen235b \
   --output_dir meta_model/outputs/union_v0_roundtrip
+
+python meta_model/scripts/04_validate_union_v0_outputs.py \
+  --model_output_dir meta_model/outputs/union_v0_roundtrip/qwen235b \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv
 ```
 
 ### Llama-4 Scout
@@ -217,9 +273,13 @@ python meta_model/scripts/03_run_union_v0_roundtrip.py \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key llama4_scout \
   --output_dir meta_model/outputs/union_v0_roundtrip
+
+python meta_model/scripts/04_validate_union_v0_outputs.py \
+  --model_output_dir meta_model/outputs/union_v0_roundtrip/llama4_scout \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv
 ```
 
-## 7. GPT-5.5 run
+## 8. GPT-5.5 run
 
 No vLLM server is needed for this condition.
 
@@ -232,9 +292,13 @@ python meta_model/scripts/03_run_union_v0_roundtrip.py \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key gpt55 \
   --output_dir meta_model/outputs/union_v0_roundtrip
+
+python meta_model/scripts/04_validate_union_v0_outputs.py \
+  --model_output_dir meta_model/outputs/union_v0_roundtrip/gpt55 \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv
 ```
 
-## 8. Individual-model replication with the new LLMs
+## 9. Individual-model replication with the new LLMs
 
 Because the LLM panel changes relative to the original researchers' experiments, the clean design is:
 
@@ -246,7 +310,7 @@ C. New LLMs + reduced meta-model prompt, later
 
 Condition A is needed to separate the effect of the LLM from the effect of the information model. Union V0 should not be compared only to historical outputs from different LLMs.
 
-## 9. After all four Union V0 runs
+## 10. After all four Union V0 runs
 
 Archive or upload:
 
