@@ -6,10 +6,12 @@
 # stop the previous vLLM server, start the next one, then run the round-trip
 # script with the matching --model_key.
 
+# max_tokens is set high enough for overlap-aware Union V0 JSON outputs.
+# Lower it in union_v0_models.local.yaml only if a specific model/server needs it.
 defaults:
   api_type: chat_completions
   temperature: 0
-  max_tokens: 3000
+  max_tokens: 4096
   timeout_seconds: 120
   max_retries: 3
   retry_sleep_seconds: 5
