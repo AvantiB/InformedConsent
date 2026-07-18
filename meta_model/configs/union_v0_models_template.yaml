@@ -1,21 +1,11 @@
 # Copy this file to union_v0_models.local.yaml and edit endpoints/model names.
 # Do not commit API keys, private endpoints, local model paths, or cluster paths.
 
-# The open-source models are intended to be run one at a time behind a vLLM
-# OpenAI-compatible server. You can reuse the same localhost port for each model:
-# stop the previous vLLM server, start the next one, then run the round-trip
-# script with the matching --model_key.
-#
-# IMPORTANT:
-# - model_key is the script/output key, for example qwen235b or llama4_scout.
-# - model is the exact model name sent to the API.
-# - For vLLM, model must exactly match the value used in --served-model-name.
-# - Therefore, edit model values in union_v0_models.local.yaml to match your
-#   current vLLM server. For example, if vLLM is launched with
-#   --served-model-name llama4, then set model: llama4 under the llama key.
+# model_key is the script/output key, for example qwen235b, llama4_scout, or mayo_gpt55.
+# model is the exact model name sent to the API for OpenAI-compatible local servers.
+# For vLLM, model must exactly match --served-model-name.
 
 # max_tokens is set high enough for overlap-aware Union V0 JSON outputs.
-# Lower it in union_v0_models.local.yaml only if a specific model/server needs it.
 defaults:
   api_type: chat_completions
   temperature: 0
@@ -33,15 +23,29 @@ models:
 
   qwen235b:
     provider: openai_compatible
-    # Keep this key name for outputs, but change model in your local YAML if
-    # your vLLM --served-model-name differs.
     model: qwen235b
     base_url: http://127.0.0.1:8000/v1
     api_key_env: VLLM_API_KEY
 
   llama4_scout:
     provider: openai_compatible
-    # Keep this key name for outputs, but change model in your local YAML if
-    # your vLLM --served-model-name differs, for example model: llama4.
+    # Change this in your local YAML if your vLLM --served-model-name differs, for example model: llama4.
     model: meta-llama/Llama-4-Scout-17B-16E-Instruct
-    base_url: http://127
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: VLLM_API_KEY
+
+  mayo_gpt55:
+    provider: mayo_apigee_azure_openai
+    model: gpt-5.5
+    deployment: gpt-5.5
+    api_version: "2024-10-21"
+    apigee_url: https://mcc.apix.mayo.edu
+    # Preferred for long runs: put the refreshed bearer token in this file.
+    # The Apigee wrapper reads this file on every request.
+    api_key_file_env: APIGEE_TOKEN_FILE
+    # Fallback for shorter runs: read bearer token directly from an environment variable.
+    api_key_env: APIGEE_TOKEN
+    max_tokens: 4096
+    timeout_seconds: 120
+    max_retries: 6
+    retry_sleep_seconds: 10
