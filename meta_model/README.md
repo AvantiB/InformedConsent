@@ -1,34 +1,47 @@
 # Data/Language-Driven Meta-Model Development
 
-This folder contains the reduced consent/data-use meta-model development workflow.
+This folder contains the workflow for deriving and validating a reduced, functional informed-consent meta-model.
 
-The goal is not to manually design a new ontology. The goal is to induce a reduced, functional meta-model from evidence produced by existing information models, consent-language round trips, and meaning-preservation behavior.
+## Correct framing
 
-## Starting point: Union V0
-
-**Union V0** is the unreduced union of source elements from ICO, DUO, FHIR Consent, and ODRL. It is intentionally bulky and serves as the naive maximal baseline from which redundancy, missing concepts, and meaning-critical distinctions can be discovered.
-
-Current comparison conditions:
-
-1. **Individual source-model JSON prompts**: DUO, ICO, ODRL, and FHIR Consent run separately with their source prompt content/data dictionaries and standardized JSON output.
-2. **Union V0 full dictionary**: all source elements in one combined prompt.
-3. **Later reduced V1 meta-model**: induced after preservation-aware analysis.
-
-## Core evidence-unit idea
-
-Each round-trip example is converted into evidence units:
+Reduced V1 is **derived from the original expert-evaluated round-trip dataset**. New LLM outputs are used for validation and stress testing, not for primary schema induction.
 
 ```text
-consent sentence
-→ extracted phrase / source-model element
-→ information model used
-→ forward mapping text
-→ backward reconstruction
-→ human label or classifier preservation score
-→ cue features and failure patterns
+Derivation / induction corpus:
+  original round-trip dataset with expert meaning-preservation labels
+
+Validation / stress-test corpus:
+  MedGemma, Qwen235B, Llama4, GPT-5.5 outputs
 ```
 
-The reduced meta-model is inferred from source-element usage, phrase/source-node co-occurrence, cue-group preservation/failure patterns, language embeddings, clustering, and preservation behavior. Human involvement should be limited to audit, naming, and interpretation of induced clusters, not manual construction of the schema.
+Expert-preserved rows are treated as functionally validated positive evidence: the forward representation contained enough structured information to support a meaning-preserving backward reconstruction. Expert-failed rows are boundary evidence: they weaken proposed merges and flag unsafe simplifications.
+
+Human involvement should be limited to audit, naming, and unsafe-merge review, not manual schema construction.
+
+## Baseline conditions
+
+1. **Individual source-model JSON prompts**: DUO, ICO, ODRL, and FHIR Consent run separately.
+2. **Union V0 full dictionary**: unreduced union of source elements from ICO, DUO, FHIR Consent, and ODRL.
+3. **Reduced V1 compact**: expert-induced reduced schema with short evidence phrases.
+4. **Reduced V1 permissive**: same reduced schema with longer evidence phrases allowed when needed.
+
+The compact/permissive split lets us test whether V1 works because of the reduced functional schema itself, or because longer evidence spans carry forward source wording.
+
+## Core evidence path
+
+```text
+expert-labeled round-trip row
+→ original consent sentence
+→ forward source-model annotations
+→ expert meaning-preservation label
+→ positive functional evidence or boundary evidence
+→ source-element profiles
+→ weighted element relationship graph
+→ graph clusters
+→ core/context/audit field selection
+→ candidate Reduced V1 schema
+→ validation on new LLM outputs
+```
 
 ## Main scripts
 
@@ -53,8 +66,6 @@ python meta_model/scripts/03_run_union_v0_roundtrip.py \
 
 ### Run individual information-model round trips
 
-Use the JSON prompt copies under `meta_model/prompts/individual_json`.
-
 ```bash
 python meta_model/scripts/05_run_individual_model_roundtrip.py \
   --roundtrips_csv "$ROUNDTRIPS_CSV" \
@@ -65,19 +76,9 @@ python meta_model/scripts/05_run_individual_model_roundtrip.py \
   --info_models all
 ```
 
-### Validate and standardize outputs
-
-```bash
-python meta_model/scripts/07_standardize_roundtrip_outputs.py \
-  --union_model_dirs meta_model/outputs/union_v0_roundtrip/medgemma,meta_model/outputs/union_v0_roundtrip/qwen235b \
-  --individual_model_dirs meta_model/outputs/individual_model_roundtrip/medgemma,meta_model/outputs/individual_model_roundtrip/qwen235b \
-  --output_dir meta_model/outputs/scoring_inputs \
-  --require_backward
-```
-
 ### Train the final scoring classifier
 
-The split-based classifier experiments remain the validation evidence. This final scorer is trained on all original human-labeled rows after model selection.
+The final scorer is trained on all original expert-labeled rows after model selection. It is used for validation scoring of new LLM outputs, not for primary Reduced V1 induction.
 
 ```bash
 python meta_model/scripts/08_train_final_meaning_classifier.py \
@@ -91,47 +92,51 @@ python meta_model/scripts/08_train_final_meaning_classifier.py \
   --nli_device cuda
 ```
 
-A lightweight fallback without embeddings/NLI is available:
+### Induce Reduced V1 from expert-labeled rows
 
 ```bash
-python meta_model/scripts/08_train_final_meaning_classifier.py \
-  --labeled_roundtrips_csv "$ROUNDTRIPS_CSV" \
-  --output_dir meta_model/outputs/final_classifier \
-  --feature_set engineered_all
-```
-
-### Score new outputs and compare baselines
-
-```bash
-python meta_model/scripts/09_score_roundtrip_outputs.py \
-  --standardized_csv meta_model/outputs/scoring_inputs/standardized_roundtrips.csv \
-  --classifier_bundle meta_model/outputs/final_classifier/final_meaning_preservation_classifier.joblib \
-  --output_dir meta_model/outputs/scored_roundtrips
+python meta_model/scripts/17_induce_reduced_v1_metamodel.py \
+  --expert_roundtrips_csv "$ROUNDTRIPS_CSV" \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv \
+  --output_dir meta_model/v1_reduced_expert \
+  --min_edge_weight 0.22 \
+  --min_core_positive_sentences 15
 ```
 
 Key outputs:
 
 ```text
-score_summary_by_condition.csv       # condition/model-level preservation proxy summaries
-paired_union_vs_individual.csv       # paired naive Union V0 vs individual-model comparisons
-scored_roundtrips.csv                # row-level classifier scores
+meta_model/v1_reduced_expert/expert_element_profiles.csv
+meta_model/v1_reduced_expert/expert_element_relationship_edges.csv
+meta_model/v1_reduced_expert/expert_element_clusters.csv
+meta_model/v1_reduced_expert/expert_cluster_evidence_summary.csv
+meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.yaml
+meta_model/v1_reduced_expert/expert_validated_induction_methodology.md
 ```
 
-See the full runbook:
+### Run Reduced V1 validation round trips
+
+```bash
+python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
+  --roundtrips_csv "$ROUNDTRIPS_CSV" \
+  --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.yaml \
+  --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
+  --model_key medgemma \
+  --output_dir meta_model/outputs/reduced_v1_roundtrip \
+  --evidence_mode compact \
+  --stage both
+```
+
+Run both `compact` and `permissive` modes for each validation LLM.
+
+## Runbooks
 
 ```text
 meta_model/ROUNDTRIP_SCORING_RUNBOOK.md
+meta_model/ROUNDTRIP_EVALUATION_METAMODEL_RUNBOOK.md
+meta_model/REDUCED_V1_METAMODEL_RUNBOOK.md
 ```
 
-## Reduced meta-model induction principle
+## Manuscript claim to preserve
 
-Candidate meta-model units should be retained when they are frequent, cross-model, preservation-sensitive, and compositionally stable. Candidate units should be merged only when their collapse does not appear to harm meaning preservation. Candidate units should be split when subclusters show different language, source-model, or preservation behavior.
-
-## Current next steps
-
-1. Finish MedGemma/Qwen individual-model and Union V0 runs.
-2. Standardize all MedGemma/Qwen outputs.
-3. Train the final classifier on all original human-labeled rows.
-4. Score MedGemma/Qwen outputs and compare individual baselines against naive Union V0.
-5. Repeat the same pipeline for Llama and GPT.
-6. Use the full scored evidence table for reduced meta-model development.
+The reduced meta-model is induced from expert-validated evidence, then validated on new LLMs. A successful V1 should preserve meaning better than individual source models and approach Union V0 while reducing annotation burden, redundancy, and model-dependent verbosity.
