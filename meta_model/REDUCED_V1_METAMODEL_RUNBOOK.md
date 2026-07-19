@@ -9,6 +9,91 @@ original sentence -> structured JSON
 structured JSON only -> reconstructed sentence
 ```
 
+## Methodology: how Reduced V1 is selected
+
+Reduced V1 is induced from a source-element evidence graph. The fields are not selected only from a hand-written recommendation. The role names are used only after clustering to label and describe empirically supported clusters.
+
+### Inputs
+
+The induction script uses corrected script-15 outputs:
+
+```text
+source_element_evidence_summary.csv
+source_element_mentions_long.csv
+source_element_cooccurrence_pairs.csv
+sentence_level_decision_summary.csv
+```
+
+Sentence-level decision fields are handled separately and are not used as span-level graph nodes:
+
+```text
+DUO.decision
+ICO.decision
+ODRL::Rule_TestSentence
+FHIR_Consent::Consent.provision.type
+```
+
+These become the V1 `decision` field.
+
+### Node construction
+
+Each remaining span-level source-model element becomes a node. Each node stores:
+
+```text
+source model
+source element ID/name/definition
+number of mentions
+number of source sentences
+number of LLMs using it
+preservation score when present
+content/cue preservation metrics
+top evidence spans
+top cue groups
+```
+
+### Edge construction
+
+Two nodes are connected when the data suggests that they are related. Edge weight combines:
+
+```text
+source-sentence co-occurrence
+same exact evidence span use
+profile similarity from labels/definitions/span examples/cue groups
+cross-source-model support
+```
+
+This is why corrected co-occurrence matters: sentence-level decision labels would otherwise dominate the graph.
+
+### Graph clustering
+
+The script clusters the weighted graph using NetworkX greedy modularity when available. If NetworkX is unavailable, it falls back to thresholded connected components. UMAP should be used only for visualization, not as the primary grouping method.
+
+### Cluster selection
+
+Clusters are summarized using:
+
+```text
+number of source elements
+number of source models represented
+number of LLMs represented
+source-sentence coverage
+mean classifier preservation score
+mean content-token recall
+mean cue-group recall
+top span examples
+top source elements
+```
+
+Clusters are labeled:
+
+```text
+core_shared: cross-source, multi-LLM, frequent, and functionally central
+context_module: lower-coverage but recurrent/context-specific
+signal_for_audit_or_extension: rare or unstable but potentially important
+```
+
+The resulting candidate YAML includes the sentence-level `decision` field plus selected graph-induced cluster fields and audit fields. Human review is used only for unsafe merges, naming, and edge-case audit, not for manual schema design.
+
 ## Design choice: run both V1 evidence variants
 
 Run both variants using the same reduced schema:
@@ -38,26 +123,32 @@ python meta_model/scripts/15_analyze_roundtrip_scored_outputs.py \
 
 The co-occurrence output should no longer be dominated by sentence-level decision fields such as `ODRL::Rule_TestSentence` or `FHIR_Consent::Consent.provision.type`.
 
-## 3. Induce the candidate reduced V1 schema
+## 3. Induce the graph-based candidate reduced V1 schema
 
 ```bash
 python meta_model/scripts/17_induce_reduced_v1_metamodel.py \
   --analysis_dir meta_model/outputs/roundtrip_meta_model_analysis_all4_v2 \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
-  --output_dir meta_model/v1_reduced
+  --output_dir meta_model/v1_reduced_graph \
+  --min_edge_weight 0.22 \
+  --min_core_sentences 15
 ```
 
 Key outputs:
 
 ```text
-meta_model/v1_reduced/candidate_role_assignments.csv
-meta_model/v1_reduced/candidate_role_evidence_summary.csv
-meta_model/v1_reduced/candidate_role_cooccurrence_summary.csv
-meta_model/v1_reduced/reduced_metamodel_v1_candidate.yaml
-meta_model/v1_reduced/reduced_metamodel_v1_candidate.md
+meta_model/v1_reduced_graph/element_nodes.csv
+meta_model/v1_reduced_graph/element_relationship_edges.csv
+meta_model/v1_reduced_graph/element_clusters.csv
+meta_model/v1_reduced_graph/cluster_evidence_summary.csv
+meta_model/v1_reduced_graph/cluster_cooccurrence_summary.csv
+meta_model/v1_reduced_graph/sentence_level_decision_fields.csv
+meta_model/v1_reduced_graph/reduced_metamodel_v1_candidate.yaml
+meta_model/v1_reduced_graph/reduced_metamodel_v1_candidate.md
+meta_model/v1_reduced_graph/reduced_v1_graph_induction_methodology.md
 ```
 
-Review the markdown and assignment CSV for obviously unsafe mappings before a large run. This is an audit step, not manual schema design.
+Review the cluster summary, edge table, and markdown for obviously unsafe merges before a large run. This is an audit step, not manual schema design.
 
 ## 4. Smoke-test Reduced V1 compact and permissive variants
 
@@ -68,7 +159,7 @@ rm -rf meta_model/outputs/reduced_v1_roundtrip_smoke/mayo_gpt55
 
 python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --roundtrips_csv /path/to/roundtrips.csv \
-  --metamodel_yaml meta_model/v1_reduced/reduced_metamodel_v1_candidate.yaml \
+  --metamodel_yaml meta_model/v1_reduced_graph/reduced_metamodel_v1_candidate.yaml \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key mayo_gpt55 \
   --output_dir meta_model/outputs/reduced_v1_roundtrip_smoke \
@@ -78,7 +169,7 @@ python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
 
 python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --roundtrips_csv /path/to/roundtrips.csv \
-  --metamodel_yaml meta_model/v1_reduced/reduced_metamodel_v1_candidate.yaml \
+  --metamodel_yaml meta_model/v1_reduced_graph/reduced_metamodel_v1_candidate.yaml \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key mayo_gpt55 \
   --output_dir meta_model/outputs/reduced_v1_roundtrip_smoke \
@@ -96,7 +187,7 @@ for MODEL in medgemma qwen235b llama4 mayo_gpt55; do
   for MODE in compact permissive; do
     python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
       --roundtrips_csv /path/to/roundtrips.csv \
-      --metamodel_yaml meta_model/v1_reduced/reduced_metamodel_v1_candidate.yaml \
+      --metamodel_yaml meta_model/v1_reduced_graph/reduced_metamodel_v1_candidate.yaml \
       --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
       --model_key "$MODEL" \
       --output_dir meta_model/outputs/reduced_v1_roundtrip \
@@ -148,16 +239,3 @@ meta_model/outputs/individual_model_roundtrip/medgemma,meta_model/outputs/indivi
 meta_model/outputs/reduced_v1_roundtrip/medgemma/compact,meta_model/outputs/reduced_v1_roundtrip/medgemma/permissive,meta_model/outputs/reduced_v1_roundtrip/qwen235b/compact,meta_model/outputs/reduced_v1_roundtrip/qwen235b/permissive,meta_model/outputs/reduced_v1_roundtrip/llama4/compact,meta_model/outputs/reduced_v1_roundtrip/llama4/permissive,meta_model/outputs/reduced_v1_roundtrip/mayo_gpt55/compact,meta_model/outputs/reduced_v1_roundtrip/mayo_gpt55/permissive \
   --output_dir meta_model/outputs/annotation_granularity_v0_individual_v1
 ```
-
-## 9. Interpretation
-
-A strong V1 result is not necessarily "V1 always beats Union V0." Union V0 can be high-recall and verbose. The desired evidence pattern is:
-
-```text
-Reduced V1 compact ≈ Union V0 on semantic preservation, with lower granularity burden.
-Reduced V1 compact > individual models on semantic/cue preservation.
-Reduced V1 permissive shows whether any V1 deficit is due to compact evidence-span constraints.
-Union V0 remains the high-recall upper-bound baseline.
-```
-
-Report compact and permissive V1 side-by-side. If permissive V1 improves a lot over compact V1, evidence-span length is still contributing materially. If compact V1 performs close to Union V0, the reduced functional schema is doing the work.
