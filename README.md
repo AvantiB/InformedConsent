@@ -5,8 +5,8 @@ Code for the informed-consent data-use and sharing project.
 ## Repository structure
 
 ```text
-meaning_preservation/   # Human-labeled round-trip classifier experiments and final proxy scorer
-meta_model/             # Union V0, individual-model round trips, scoring, and reduced meta-model development
+meaning_preservation/   # Expert-labeled round-trip classifier experiments and final proxy scorer
+meta_model/             # Union V0, individual-model round trips, expert-induced Reduced V1, and validation
 ```
 
 ## Current workflow
@@ -14,7 +14,19 @@ meta_model/             # Union V0, individual-model round trips, scoring, and r
 The project has two linked components.
 
 1. **Meaning-preservation classifier**: trains and evaluates a proxy classifier for whether an LLM backward reconstruction preserves the meaning of the original consent sentence.
-2. **Meta-model development**: compares original individual information-model prompts against an unreduced Union V0 baseline, scores new LLM round trips with the classifier, and then uses those results to induce a reduced consent/data-use meta-model.
+2. **Meta-model development**: derives a reduced consent/data-use meta-model from the original expert-evaluated round-trip dataset, then validates it against individual models and the unreduced Union V0 baseline using new LLM outputs.
+
+## Key principle
+
+```text
+Derivation / induction corpus:
+  original expert-evaluated round-trip dataset
+
+Validation / stress-test corpus:
+  MedGemma, Qwen235B, Llama4, GPT-5.5 generated outputs
+```
+
+Expert-preserved rows are treated as functionally validated positive evidence. Expert-failed rows are boundary evidence. Classifier scores on new LLM outputs are proxy validation outcomes, not human gold labels.
 
 ## Key runbooks
 
@@ -24,18 +36,15 @@ meta_model/README.md
 meta_model/UNION_V0_ROUNDTRIP_RUNBOOK.md
 meta_model/INDIVIDUAL_MODEL_REPLICATION_RUNBOOK.md
 meta_model/ROUNDTRIP_SCORING_RUNBOOK.md
+meta_model/REDUCED_V1_METAMODEL_RUNBOOK.md
 ```
 
 ## Current stage
 
-MedGemma and Qwen are being run for Union V0 and individual information-model conditions. The next stage is:
-
 ```text
-A. Validate and standardize all round-trip outputs.
-B. Train the final scoring classifier on all original human-labeled rows.
-C. Score MedGemma/Qwen Union V0 and individual-model outputs.
-D. Compare individual-model baselines against naive Union V0.
-E. Repeat for Llama/GPT, then proceed to reduced meta-model induction.
+A. Use the original expert-labeled rows to train the final scoring classifier.
+B. Use the original expert-labeled rows to induce Reduced V1 via source-element graph evidence.
+C. Run Reduced V1 compact/permissive round trips on validation LLMs.
+D. Compare individual models vs Union V0 vs Reduced V1 compact vs Reduced V1 permissive.
+E. Report meaning preservation, cue/content preservation, parse stability, and annotation granularity.
 ```
-
-Classifier scores on new LLM outputs are proxy preservation estimates, not human gold labels. The split-based classifier experiments remain the classifier validation evidence.
