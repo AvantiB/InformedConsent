@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Standardize Union V0 and individual information-model round-trip outputs.
+"""Standardize Union V0, individual source-model, and reduced V1 round-trip outputs.
 
 The output is a single classifier-ready CSV with one row per source sentence,
 LLM, condition, and information model.
@@ -16,6 +16,7 @@ from typing import Any
 import pandas as pd
 
 INFO_MODELS = ["DUO", "ICO", "ODRL", "FHIR_Consent"]
+V1_ROLE_FIELDS = ["decision", "action", "resource", "actor", "recipient_or_grantee", "purpose", "condition", "constraint_or_exception", "temporal_scope", "privacy_identifiability", "choice_structure", "lifecycle_effect", "risk_benefit_or_results", "residual_important_content"]
 
 
 def norm(x: Any) -> str:
@@ -32,7 +33,7 @@ def norm(x: Any) -> str:
 def strip_fence(text: str) -> str:
     text = norm(text)
     if text.startswith("```"):
-        text = re.sub(r"^```(?:json|csv)?\s*", "", text, flags=re.I)
+        text = re.sub(r"^```(?:json|csv|yaml)?\s*", "", text, flags=re.I)
         text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
@@ -110,11 +111,39 @@ def annotation_counts_from_obj(obj: Any) -> tuple[int, int]:
     return len(anns), len(set(labels))
 
 
+def v1_role_counts(obj: Any) -> tuple[int, int]:
+    if not isinstance(obj, dict):
+        return 0, 0
+    n = 0
+    roles = set()
+    for prov in obj.get("provisions") or []:
+        if not isinstance(prov, dict):
+            continue
+        for role in V1_ROLE_FIELDS:
+            val = prov.get(role)
+            if role == "decision":
+                if isinstance(val, dict) and (norm(val.get("value")) or norm(val.get("evidence_span_text"))):
+                    n += 1; roles.add(role)
+                continue
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict) and any(norm(x) for x in item.values()):
+                        n += 1; roles.add(role)
+                    elif norm(item):
+                        n += 1; roles.add(role)
+            elif norm(val):
+                n += 1; roles.add(role)
+    return n, len(roles)
+
+
 def forward_counts(raw: str, parsed_forward: Any = None) -> tuple[int, int, bool]:
     obj = parsed_forward if parsed_forward else parse_jsonish(raw)
     n, u = annotation_counts_from_obj(obj)
     if n:
         return n, u, True
+    vn, vu = v1_role_counts(obj)
+    if vn:
+        return vn, vu, True
     text = strip_fence(raw)
     if not text:
         return 0, 0, False
@@ -143,30 +172,31 @@ def standardize_union(model_dir: Path):
         parsed = f.get("parsed_forward") if isinstance(f.get("parsed_forward"), dict) else None
         n_ann, n_unique, parse_ok = forward_counts(norm(f.get("raw_response", "")), parsed)
         rec = reconstruction(b)
-        rows.append({
-            "roundtrip_id": f"{model_key}__Union_V0__{sid}",
-            "source_id": sid,
-            "source_text": norm(f.get("source_text") or b.get("source_text")),
-            "original_text": norm(f.get("source_text") or b.get("source_text")),
-            "reconstructed_sentence": rec,
-            "reconstructed_text": rec,
-            "forward_mapping": json.dumps(parsed, ensure_ascii=False) if parsed else norm(f.get("raw_response", "")),
-            "llm": model_key,
-            "model": f.get("model") or b.get("model") or model_key,
-            "condition": "union_v0_full_dictionary",
-            "information_model": "Union_V0",
-            "info_model": "Union_V0",
-            "annotation_count": n_ann,
-            "unique_element_count": n_unique,
-            "forward_parse_ok": parse_ok,
-            "backward_parse_ok": bool(rec),
-            "has_forward": sid in fwd,
-            "has_backward": sid in bwd,
-            "output_dir": str(model_dir),
-        })
+        rows.append({"roundtrip_id": f"{model_key}__Union_V0__{sid}", "source_id": sid, "source_text": norm(f.get("source_text") or b.get("source_text")), "original_text": norm(f.get("source_text") or b.get("source_text")), "reconstructed_sentence": rec, "reconstructed_text": rec, "forward_mapping": json.dumps(parsed, ensure_ascii=False) if parsed else norm(f.get("raw_response", "")), "llm": model_key, "model": f.get("model") or b.get("model") or model_key, "condition": "union_v0_full_dictionary", "information_model": "Union_V0", "info_model": "Union_V0", "annotation_count": n_ann, "unique_element_count": n_unique, "forward_parse_ok": parse_ok, "backward_parse_ok": bool(rec), "has_forward": sid in fwd, "has_backward": sid in bwd, "output_dir": str(model_dir)})
         if sid not in fwd or sid not in bwd:
             missing.append({"output_dir": str(model_dir), "source_id": sid, "has_forward": sid in fwd, "has_backward": sid in bwd})
     audit = [{"output_dir": str(model_dir), "condition": "union_v0_full_dictionary", "llm": model_key, "information_model": "Union_V0", "n_forward": len(fwd), "n_backward": len(bwd), "n_standardized": len(rows), "n_missing_pairs": len(missing)}]
+    return rows, audit, missing
+
+
+def standardize_reduced_v1(model_dir: Path):
+    evidence_mode = model_dir.name
+    model_key = model_dir.parent.name if evidence_mode in {"compact", "permissive"} else model_dir.name
+    if evidence_mode not in {"compact", "permissive"}:
+        evidence_mode = "unknown"
+    condition = f"reduced_v1_{evidence_mode}"
+    fwd = by_id(read_jsonl(model_dir / "reduced_v1_forward_mappings.jsonl"))
+    bwd = by_id(read_jsonl(model_dir / "reduced_v1_backward_reconstructions.jsonl"))
+    rows, missing = [], []
+    for sid in sorted(set(fwd) | set(bwd)):
+        f, b = fwd.get(sid, {}), bwd.get(sid, {})
+        parsed = f.get("parsed_forward") if isinstance(f.get("parsed_forward"), dict) else None
+        n_ann, n_unique, parse_ok = forward_counts(norm(f.get("raw_response", "")), parsed)
+        rec = reconstruction(b)
+        rows.append({"roundtrip_id": f"{model_key}__Reduced_V1_{evidence_mode}__{sid}", "source_id": sid, "source_text": norm(f.get("source_text") or b.get("source_text")), "original_text": norm(f.get("source_text") or b.get("source_text")), "reconstructed_sentence": rec, "reconstructed_text": rec, "forward_mapping": json.dumps(parsed, ensure_ascii=False) if parsed else norm(f.get("raw_response", "")), "llm": model_key, "model": f.get("model") or b.get("model") or model_key, "condition": condition, "information_model": "Reduced_V1", "info_model": "Reduced_V1", "evidence_mode": evidence_mode, "annotation_count": n_ann, "unique_element_count": n_unique, "forward_parse_ok": parse_ok, "backward_parse_ok": bool(rec), "has_forward": sid in fwd, "has_backward": sid in bwd, "output_dir": str(model_dir)})
+        if sid not in fwd or sid not in bwd:
+            missing.append({"output_dir": str(model_dir), "source_id": sid, "has_forward": sid in fwd, "has_backward": sid in bwd})
+    audit = [{"output_dir": str(model_dir), "condition": condition, "llm": model_key, "information_model": "Reduced_V1", "n_forward": len(fwd), "n_backward": len(bwd), "n_standardized": len(rows), "n_missing_pairs": len(missing)}]
     return rows, audit, missing
 
 
@@ -183,27 +213,7 @@ def standardize_individual(model_dir: Path):
             raw = norm(f.get("raw_response", ""))
             n_ann, n_unique, parse_ok = forward_counts(raw)
             rec = reconstruction(b)
-            rows.append({
-                "roundtrip_id": f"{model_key}__{info}__{sid}",
-                "source_id": sid,
-                "source_text": norm(f.get("source_text") or b.get("source_text")),
-                "original_text": norm(f.get("source_text") or b.get("source_text")),
-                "reconstructed_sentence": rec,
-                "reconstructed_text": rec,
-                "forward_mapping": raw,
-                "llm": model_key,
-                "model": f.get("model") or b.get("model") or model_key,
-                "condition": "individual_source_model_json",
-                "information_model": info,
-                "info_model": info,
-                "annotation_count": n_ann,
-                "unique_element_count": n_unique,
-                "forward_parse_ok": parse_ok,
-                "backward_parse_ok": bool(rec),
-                "has_forward": sid in fwd,
-                "has_backward": sid in bwd,
-                "output_dir": str(sub),
-            })
+            rows.append({"roundtrip_id": f"{model_key}__{info}__{sid}", "source_id": sid, "source_text": norm(f.get("source_text") or b.get("source_text")), "original_text": norm(f.get("source_text") or b.get("source_text")), "reconstructed_sentence": rec, "reconstructed_text": rec, "forward_mapping": raw, "llm": model_key, "model": f.get("model") or b.get("model") or model_key, "condition": "individual_source_model_json", "information_model": info, "info_model": info, "annotation_count": n_ann, "unique_element_count": n_unique, "forward_parse_ok": parse_ok, "backward_parse_ok": bool(rec), "has_forward": sid in fwd, "has_backward": sid in bwd, "output_dir": str(sub)})
             if sid not in fwd or sid not in bwd:
                 n_missing += 1
                 missing.append({"output_dir": str(sub), "source_id": sid, "has_forward": sid in fwd, "has_backward": sid in bwd})
@@ -219,18 +229,17 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--union_model_dirs", default="", help="Comma-separated Union V0 model output dirs.")
     ap.add_argument("--individual_model_dirs", default="", help="Comma-separated individual model output dirs.")
+    ap.add_argument("--reduced_v1_model_dirs", default="", help="Comma-separated Reduced V1 output dirs, usually .../<model_key>/<compact|permissive>.")
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--require_backward", action="store_true")
     args = ap.parse_args()
-
     rows, audit, missing = [], [], []
     for d in split_paths(args.union_model_dirs):
-        r, a, m = standardize_union(d)
-        rows += r; audit += a; missing += m
+        r, a, m = standardize_union(d); rows += r; audit += a; missing += m
     for d in split_paths(args.individual_model_dirs):
-        r, a, m = standardize_individual(d)
-        rows += r; audit += a; missing += m
-
+        r, a, m = standardize_individual(d); rows += r; audit += a; missing += m
+    for d in split_paths(args.reduced_v1_model_dirs):
+        r, a, m = standardize_reduced_v1(d); rows += r; audit += a; missing += m
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)
