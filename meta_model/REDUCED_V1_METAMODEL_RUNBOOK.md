@@ -1,105 +1,36 @@
 # Reduced V1 meta-model induction and validation runbook
 
-This runbook starts after the corrected all-model analysis has been generated with `15_analyze_roundtrip_scored_outputs.py` after the sentence-level decision fix.
+This is the authoritative runbook for the reduced V1 informed-consent meta-model.
 
-The goal is to induce and validate a reduced, provision-centered functional meta-model from Union V0 and individual-model evidence. Reduced V1 uses the same round-trip structure as Union V0:
+## Correct study framing
+
+Reduced V1 is derived from the original expert-evaluated round-trip dataset, not from the new MedGemma/Qwen/Llama/GPT outputs.
+
+```text
+Derivation / induction corpus:
+  original round-trip dataset with expert meaning-preservation labels
+
+Validation / stress-test corpus:
+  new MedGemma, Qwen235B, Llama4, GPT-5.5 round-trip outputs
+```
+
+Expert-preserved rows are treated as functionally validated positive evidence: the forward representation contained enough information to reconstruct the original sentence meaning. Expert-failed rows are boundary evidence: they weaken proposed merges and flag unsafe simplifications.
+
+The new all-model outputs are used later to test whether the expert-induced V1 schema generalizes across LLMs and whether compact/permissive evidence modes behave differently.
+
+## Round-trip structure kept comparable to Union V0
+
+Reduced V1 keeps the same basic evaluation structure as Union V0:
 
 ```text
 original sentence -> structured JSON
 structured JSON only -> reconstructed sentence
 ```
 
-## Methodology: how Reduced V1 is selected
+Two V1 evidence variants should be evaluated using the same schema:
 
-Reduced V1 is induced from a source-element evidence graph. The fields are not selected only from a hand-written recommendation. The role names are used only after clustering to label and describe empirically supported clusters.
-
-### Inputs
-
-The induction script uses corrected script-15 outputs:
-
-```text
-source_element_evidence_summary.csv
-source_element_mentions_long.csv
-source_element_cooccurrence_pairs.csv
-sentence_level_decision_summary.csv
-```
-
-Sentence-level decision fields are handled separately and are not used as span-level graph nodes:
-
-```text
-DUO.decision
-ICO.decision
-ODRL::Rule_TestSentence
-FHIR_Consent::Consent.provision.type
-```
-
-These become the V1 `decision` field.
-
-### Node construction
-
-Each remaining span-level source-model element becomes a node. Each node stores:
-
-```text
-source model
-source element ID/name/definition
-number of mentions
-number of source sentences
-number of LLMs using it
-preservation score when present
-content/cue preservation metrics
-top evidence spans
-top cue groups
-```
-
-### Edge construction
-
-Two nodes are connected when the data suggests that they are related. Edge weight combines:
-
-```text
-source-sentence co-occurrence
-same exact evidence span use
-profile similarity from labels/definitions/span examples/cue groups
-cross-source-model support
-```
-
-This is why corrected co-occurrence matters: sentence-level decision labels would otherwise dominate the graph.
-
-### Graph clustering
-
-The script clusters the weighted graph using NetworkX greedy modularity when available. If NetworkX is unavailable, it falls back to thresholded connected components. UMAP should be used only for visualization, not as the primary grouping method.
-
-### Cluster selection
-
-Clusters are summarized using:
-
-```text
-number of source elements
-number of source models represented
-number of LLMs represented
-source-sentence coverage
-mean classifier preservation score
-mean content-token recall
-mean cue-group recall
-top span examples
-top source elements
-```
-
-Clusters are labeled:
-
-```text
-core_shared: cross-source, multi-LLM, frequent, and functionally central
-context_module: lower-coverage but recurrent/context-specific
-signal_for_audit_or_extension: rare or unstable but potentially important
-```
-
-The resulting candidate YAML includes the sentence-level `decision` field plus selected graph-induced cluster fields and audit fields. Human review is used only for unsafe merges, naming, and edge-case audit, not for manual schema design.
-
-## Design choice: run both V1 evidence variants
-
-Run both variants using the same reduced schema:
-
-1. `compact`: short evidence phrases only. This tests whether the reduced schema itself preserves meaning without long-clause evidence spans.
-2. `permissive`: same reduced schema, but allows longer evidence phrases when needed. This controls for the annotation-granularity effect observed in Union V0, especially with GPT-5.5.
+1. `compact`: short evidence phrases only. Tests whether the reduced schema itself preserves meaning without long-clause evidence spans.
+2. `permissive`: same reduced schema, but longer evidence phrases are allowed when needed. Controls for annotation-granularity effects observed in Union V0.
 
 ## 1. Pull and compile
 
@@ -112,54 +43,91 @@ python -m py_compile meta_model/scripts/17_induce_reduced_v1_metamodel.py
 python -m py_compile meta_model/scripts/18_run_reduced_v1_roundtrip.py
 ```
 
-## 2. Make sure corrected V0/individual analysis exists
+## 2. Induce Reduced V1 from the expert-labeled corpus
 
-```bash
-python meta_model/scripts/15_analyze_roundtrip_scored_outputs.py \
-  --scored_csv meta_model/outputs/scored_roundtrips_all4/scored_roundtrips.csv \
-  --inventory_csv meta_model/v0_union/source_element_inventory.csv \
-  --output_dir meta_model/outputs/roundtrip_meta_model_analysis_all4_v2
-```
-
-The co-occurrence output should no longer be dominated by sentence-level decision fields such as `ODRL::Rule_TestSentence` or `FHIR_Consent::Consent.provision.type`.
-
-## 3. Induce the graph-based candidate reduced V1 schema
+Use the original expert-evaluated round-trip CSV. The script auto-detects common column names for original sentence, forward mapping, information model, LLM, and expert label. Use `--label_col` if the label column is not auto-detected.
 
 ```bash
 python meta_model/scripts/17_induce_reduced_v1_metamodel.py \
-  --analysis_dir meta_model/outputs/roundtrip_meta_model_analysis_all4_v2 \
+  --expert_roundtrips_csv /path/to/expert_evaluated_roundtrips.csv \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
-  --output_dir meta_model/v1_reduced_graph \
+  --output_dir meta_model/v1_reduced_expert \
   --min_edge_weight 0.22 \
-  --min_core_sentences 15
+  --min_core_positive_sentences 15
 ```
 
-Key outputs:
+If needed:
+
+```bash
+python meta_model/scripts/17_induce_reduced_v1_metamodel.py \
+  --expert_roundtrips_csv /path/to/expert_evaluated_roundtrips.csv \
+  --label_col meaning_preserved \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv \
+  --output_dir meta_model/v1_reduced_expert
+```
+
+## 3. Evidence outputs from induction
 
 ```text
-meta_model/v1_reduced_graph/element_nodes.csv
-meta_model/v1_reduced_graph/element_relationship_edges.csv
-meta_model/v1_reduced_graph/element_clusters.csv
-meta_model/v1_reduced_graph/cluster_evidence_summary.csv
-meta_model/v1_reduced_graph/cluster_cooccurrence_summary.csv
-meta_model/v1_reduced_graph/sentence_level_decision_fields.csv
-meta_model/v1_reduced_graph/reduced_metamodel_v1_candidate.yaml
-meta_model/v1_reduced_graph/reduced_metamodel_v1_candidate.md
-meta_model/v1_reduced_graph/reduced_v1_graph_induction_methodology.md
+meta_model/v1_reduced_expert/expert_element_mentions_long.csv
+meta_model/v1_reduced_expert/expert_sentence_level_decision_mentions_long.csv
+meta_model/v1_reduced_expert/expert_element_profiles.csv
+meta_model/v1_reduced_expert/expert_element_relationship_edges.csv
+meta_model/v1_reduced_expert/expert_element_clusters.csv
+meta_model/v1_reduced_expert/expert_cluster_evidence_summary.csv
+meta_model/v1_reduced_expert/expert_sentence_level_decision_summary.csv
+meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.yaml
+meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.md
+meta_model/v1_reduced_expert/expert_validated_induction_methodology.md
 ```
 
-Review the cluster summary, edge table, and markdown for obviously unsafe merges before a large run. This is an audit step, not manual schema design.
+## 4. Methodology implemented by script 17
 
-## 4. Smoke-test Reduced V1 compact and permissive variants
+1. Parse original forward mappings into source-element mentions.
+2. Separate sentence-level decision fields:
+   - `DUO.decision`
+   - `ICO.decision`
+   - `ODRL::Rule_TestSentence`
+   - `FHIR_Consent::Consent.provision.type`
+3. Treat annotations from expert-preserved rows as positive functional evidence.
+4. Treat annotations from expert-failed rows as boundary/failure evidence.
+5. Build source-element profiles containing frequency, sentence coverage, LLM support, source-model support, positive rate, and span examples.
+6. Build weighted graph edges from:
+   - expert-positive co-occurrence;
+   - same-span expert-positive use;
+   - label/definition/span similarity;
+   - cross-source-model support.
+7. Penalize edges when the same element pair occurs mainly in expert-failed rows.
+8. Cluster the weighted graph.
+9. Select clusters as:
+   - `core_shared`: frequent expert-positive evidence, cross-source support, multi-LLM support;
+   - `context_module`: coherent but less broadly shared evidence;
+   - `audit_or_extension` or `failure_boundary_audit`: rare, uncertain, or failure-associated evidence.
+10. Generate the candidate Reduced V1 YAML schema with field-level selection evidence.
 
-Example with GPT-5.5 through Apigee:
+UMAP may be added later for visualization only. It is not the primary grouping method.
+
+## 5. Audit before running V1
+
+Before running a large V1 experiment, inspect:
+
+```bash
+less meta_model/v1_reduced_expert/expert_validated_induction_methodology.md
+less meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.md
+head -30 meta_model/v1_reduced_expert/expert_cluster_evidence_summary.csv
+head -30 meta_model/v1_reduced_expert/expert_element_relationship_edges.csv
+```
+
+This audit is for unsafe merges, bad names, or parsing failures. It is not manual schema design.
+
+## 6. Smoke-test Reduced V1 compact and permissive variants
 
 ```bash
 rm -rf meta_model/outputs/reduced_v1_roundtrip_smoke/mayo_gpt55
 
 python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --roundtrips_csv /path/to/roundtrips.csv \
-  --metamodel_yaml meta_model/v1_reduced_graph/reduced_metamodel_v1_candidate.yaml \
+  --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.yaml \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key mayo_gpt55 \
   --output_dir meta_model/outputs/reduced_v1_roundtrip_smoke \
@@ -169,7 +137,7 @@ python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
 
 python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --roundtrips_csv /path/to/roundtrips.csv \
-  --metamodel_yaml meta_model/v1_reduced_graph/reduced_metamodel_v1_candidate.yaml \
+  --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.yaml \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key mayo_gpt55 \
   --output_dir meta_model/outputs/reduced_v1_roundtrip_smoke \
@@ -178,16 +146,16 @@ python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --limit 3
 ```
 
-## 5. Full Reduced V1 runs
+## 7. Full Reduced V1 validation runs
 
-Run both evidence modes for each model you want to compare.
+Run both evidence modes for each validation model.
 
 ```bash
 for MODEL in medgemma qwen235b llama4 mayo_gpt55; do
   for MODE in compact permissive; do
     python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
       --roundtrips_csv /path/to/roundtrips.csv \
-      --metamodel_yaml meta_model/v1_reduced_graph/reduced_metamodel_v1_candidate.yaml \
+      --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.yaml \
       --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
       --model_key "$MODEL" \
       --output_dir meta_model/outputs/reduced_v1_roundtrip \
@@ -197,9 +165,7 @@ for MODEL in medgemma qwen235b llama4 mayo_gpt55; do
 done
 ```
 
-For slow API models, run one model/mode at a time in `tmux`.
-
-## 6. Standardize all model conditions, including Reduced V1
+## 8. Standardize all validation conditions
 
 ```bash
 python meta_model/scripts/07_standardize_roundtrip_outputs.py \
@@ -213,7 +179,7 @@ meta_model/outputs/reduced_v1_roundtrip/medgemma/compact,meta_model/outputs/redu
   --require_backward
 ```
 
-## 7. Score and analyze
+## 9. Score and analyze validation outputs
 
 ```bash
 python meta_model/scripts/09_score_roundtrip_outputs.py \
@@ -227,7 +193,7 @@ python meta_model/scripts/15_analyze_roundtrip_scored_outputs.py \
   --output_dir meta_model/outputs/roundtrip_meta_model_analysis_v0_individual_v1
 ```
 
-## 8. Annotation/role granularity audit including V1
+## 10. Annotation granularity audit including V1
 
 ```bash
 python meta_model/scripts/16_audit_annotation_granularity.py \
@@ -239,3 +205,7 @@ meta_model/outputs/individual_model_roundtrip/medgemma,meta_model/outputs/indivi
 meta_model/outputs/reduced_v1_roundtrip/medgemma/compact,meta_model/outputs/reduced_v1_roundtrip/medgemma/permissive,meta_model/outputs/reduced_v1_roundtrip/qwen235b/compact,meta_model/outputs/reduced_v1_roundtrip/qwen235b/permissive,meta_model/outputs/reduced_v1_roundtrip/llama4/compact,meta_model/outputs/reduced_v1_roundtrip/llama4/permissive,meta_model/outputs/reduced_v1_roundtrip/mayo_gpt55/compact,meta_model/outputs/reduced_v1_roundtrip/mayo_gpt55/permissive \
   --output_dir meta_model/outputs/annotation_granularity_v0_individual_v1
 ```
+
+## Manuscript framing
+
+The reduced V1 meta-model is induced from expert-validated evidence. New LLM outputs are validation conditions. A successful V1 does not need to beat Union V0 on every raw score; it should preserve meaning better than individual source models and approach Union V0 while reducing annotation burden, redundancy, and model-dependent verbosity.
