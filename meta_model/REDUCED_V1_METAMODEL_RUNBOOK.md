@@ -1,4 +1,4 @@
-# Reduced V1 meta-model discovery, audit, and validation runbook
+# Reduced V1 meta-model discovery, audit, visualization, and validation runbook
 
 This is the authoritative runbook for the reduced V1 informed-consent meta-model.
 
@@ -18,12 +18,12 @@ Expert-preserved rows are positive functional evidence. Expert-failed rows are b
 
 ## Important methodological correction
 
-V1 is **not** induced by hard-coding fields such as action/resource/actor. The workflow separates two empirical graphs:
+V1 is **not** induced by hard-coding fields such as action/resource/actor. The workflow separates two empirical graph views:
 
-1. **Semantic-equivalence graph**: asks which source-model elements may express the same semantic field. Edges come from same/overlapping evidence spans, cross-information-model support, cross-LLM support, expert-positive evidence, and profile similarity.
+1. **Semantic-equivalence graph**: asks which source-model elements may express the same semantic field. Edges come from same/overlapping evidence spans, cross-information-model support, cross-LLM support, expert-positive evidence, failure penalties, and profile similarity.
 2. **Provision-bundle graph**: asks which elements co-occur compositionally in consent sentences. This graph is used to understand provision structure, not to merge fields.
 
-The final V1 schema is not generated directly by script 17. Script 17 writes empirical clusters and an audit template. Humans only name/select clusters and flag unsafe merges/splits. Script 20 then converts the audited cluster table into the V1 YAML schema.
+Script 17 writes empirical clusters and an audit template. Script 19 visualizes the evidence. Script 20 converts the audited cluster table into the final V1 YAML schema. Humans only name/select clusters and flag unsafe merges/splits.
 
 ## 1. Pull and compile
 
@@ -32,6 +32,7 @@ git pull origin main
 
 python -m py_compile meta_model/scripts/12_build_expert_roundtrip_corpus.py
 python -m py_compile meta_model/scripts/17_induce_reduced_v1_metamodel.py
+python -m py_compile meta_model/scripts/19_visualize_v1_discovery.py
 python -m py_compile meta_model/scripts/20_build_reduced_v1_schema_from_audit.py
 python -m py_compile meta_model/scripts/18_run_reduced_v1_roundtrip.py
 ```
@@ -88,16 +89,46 @@ Interpretation:
 ```text
 semantic_equivalence_edges/clusters = candidate field merges
 provision_bundle_edges = composition/co-occurrence, not merge evidence
-semantic_cluster_audit_template.csv = the file to audit/name before schema creation
+semantic_cluster_audit_template.csv = file to audit/name before schema creation
 ```
 
-## 4. Audit semantic clusters
+## 4. Visualize and defend the discovery evidence
+
+```bash
+python meta_model/scripts/19_visualize_v1_discovery.py \
+  --discovery_dir meta_model/v1_reduced_expert \
+  --output_dir meta_model/v1_reduced_expert/visual_report
+```
+
+Key visualization outputs:
+
+```text
+cluster_support_corrected.csv
+semantic_cluster_support.png
+semantic_cluster_source_model_heatmap.png
+semantic_cluster_network.png
+provision_bundle_cluster_network.png
+semantic_cluster_edge_summary.csv
+top_semantic_equivalence_edges.csv
+top_provision_bundle_edges.csv
+v1_discovery_visual_audit_report.md
+```
+
+Use these figures to support the results/discussion section:
+
+- **Cluster support plot**: shows which candidate semantic clusters are repeatedly observed in expert-preserved examples.
+- **Source-model heatmap**: shows whether a cluster is supported across DUO, ICO, FHIR Consent, and ODRL rather than being source-model-specific.
+- **Semantic cluster network**: shows merge pressure from same/overlapping evidence spans and expert-positive support.
+- **Provision-bundle network**: shows compositional structure of informed-consent provisions; it supports the provision-centered schema but is not used as merge evidence.
+
+## 5. Audit semantic clusters
 
 Open:
 
 ```bash
 column -s, -t < meta_model/v1_reduced_expert/semantic_cluster_audit_template.csv | less -S
 less meta_model/v1_reduced_expert/semantic_cluster_discovery_report.md
+less meta_model/v1_reduced_expert/visual_report/v1_discovery_visual_audit_report.md
 ```
 
 Fill these columns in `semantic_cluster_audit_template.csv`:
@@ -112,9 +143,7 @@ split_or_merge_notes notes for downstream schema construction
 
 This is the human audit/naming step, not manual schema design. Cluster membership and support are data-derived.
 
-## 5. Build the audited V1 schema
-
-After auditing the template:
+## 6. Build the audited V1 schema
 
 ```bash
 python meta_model/scripts/20_build_reduced_v1_schema_from_audit.py \
@@ -127,7 +156,7 @@ python meta_model/scripts/20_build_reduced_v1_schema_from_audit.py \
 
 The schema builder will fail if no clusters are explicitly selected with `include_in_v1=yes` and `final_field_name` filled in.
 
-## 6. Smoke-test Reduced V1 compact/permissive variants
+## 7. Smoke-test Reduced V1 compact/permissive variants
 
 ```bash
 python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
@@ -139,22 +168,14 @@ python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --evidence_mode compact \
   --stage both \
   --limit 3
-
-python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
-  --roundtrips_csv /path/to/roundtrips.csv \
-  --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_audited.yaml \
-  --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
-  --model_key mayo_gpt55 \
-  --output_dir meta_model/outputs/reduced_v1_roundtrip_smoke \
-  --evidence_mode permissive \
-  --stage both \
-  --limit 3
 ```
 
-## 7. Full validation
+Repeat with `--evidence_mode permissive`.
+
+## 8. Full validation
 
 Run both evidence modes for each validation model, then standardize, score, and compare against individual-model and Union V0 baselines as before.
 
 ## Manuscript framing
 
-The reduced V1 meta-model is discovered from expert-validated semantic-equivalence evidence, finalized by limited audit/naming, and validated on new LLM outputs. A good V1 should approach Union V0 meaning preservation while reducing redundancy and annotation burden.
+The reduced V1 meta-model is discovered from expert-validated semantic-equivalence evidence, visualized through semantic and bundle graphs, finalized by limited audit/naming, and validated on new LLM outputs. A good V1 should approach Union V0 meaning preservation while reducing redundancy and annotation burden.
