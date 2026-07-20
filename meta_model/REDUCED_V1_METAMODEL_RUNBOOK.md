@@ -1,4 +1,4 @@
-# Reduced V1 meta-model discovery, provisional evaluation, audit, visualization, and validation runbook
+# Reduced V1 meta-model discovery, smoke testing, audit, visualization, and validation runbook
 
 This is the authoritative runbook for the reduced V1 informed-consent meta-model.
 
@@ -23,7 +23,7 @@ V1 is not induced by hard-coding fields such as action/resource/actor. The workf
 1. Semantic-equivalence graph: candidate field merges from same/overlapping evidence spans, cross-information-model support, cross-LLM support, expert-positive evidence, failure penalties, and profile similarity.
 2. Provision-bundle graph: compositional co-occurrence in consent sentences. This supports a provision-centered schema, but is not used directly as merge evidence.
 
-Script 17 writes empirical clusters and an audit template. Script 19 visualizes the evidence. Script 21 builds a provisional cluster-ID schema so the data-driven model can be evaluated as-is. Script 20 converts a PI/expert-audited cluster table into the final V1 YAML schema.
+Script 17 writes empirical clusters and an audit template. Script 19 visualizes the evidence. Script 21 builds a provisional cluster-ID schema so the data-driven model can be smoke-tested as-is. Script 20 converts a PI/expert-audited cluster table into the final V1 YAML schema.
 
 ## 1. Pull and compile
 
@@ -94,9 +94,9 @@ semantic cluster network = merge pressure from same/overlapping spans
 provision-bundle network = how fields compose in consent provisions
 ```
 
-## 5. Build a provisional empirical V1 schema for performance testing
+## 5. Build a provisional empirical V1 schema for smoke testing
 
-This step intentionally uses the discovered clusters as-is. Field names are provisional cluster IDs such as `semantic_cluster_C001`, so performance can be measured before the PI names or reorganizes the fields.
+This step intentionally uses the discovered clusters as-is. Field names are provisional cluster IDs such as `semantic_cluster_C001`, so behavior can be inspected before the PI names or reorganizes the fields.
 
 ```bash
 python meta_model/scripts/21_build_provisional_v1_schema_from_clusters.py \
@@ -113,76 +113,109 @@ Describe this condition as:
 Provisional empirical V1: data-driven semantic clusters evaluated before expert naming/organization.
 ```
 
-## 6. Run provisional V1 compact/permissive tests with one hosted vLLM model at a time
+## 6. V1 reduced smoke tests only
 
-Do not loop over all models unless all models are simultaneously hosted. For the local vLLM setup, start one model server, run compact and permissive for that model, stop the server, then repeat for the next model.
+Do **not** run the full dataset yet. First inspect a small number of examples from two currently hosted models, MedGemma and Qwen. The V1 runner now uses a V0-like prompt structure:
 
-### A. Start the vLLM server for one model
+```text
+sentence_decision
+sentence_level_elements
+annotations
+interpretation_units
+unmatched_language
+```
 
-Use the model-specific vLLM command from your local environment/configuration. Keep the served model name and port aligned with `meta_model/configs/union_v0_models.local.yaml`.
+The prompt uses neutral cluster-dictionary wording, does not say “V1 meta-model” to the LLM, does not use named roles, and treats permit/deny/mixed/unclear as sentence/provision-level decisions only.
 
-Example pattern:
+### A. Start one hosted vLLM model
+
+Use the model-specific command from your local environment/configuration. Keep served model name and port aligned with `meta_model/configs/union_v0_models.local.yaml`.
 
 ```bash
 # Terminal 1: start exactly one model server
-# Replace with the correct model path/name/port for the current model.
+# Replace with the correct model path/name/port.
 vllm serve /path/to/current/model \
   --served-model-name CURRENT_SERVED_MODEL_NAME \
   --port 8000
 ```
 
-Wait until the health check responds before running the round trips.
+Wait for the health check to respond.
 
-### B. Run compact and permissive for the hosted model only
+### B. Smoke test MedGemma or Qwen, one hosted model at a time
 
-Set `MODEL_KEY` to the key in `meta_model/configs/union_v0_models.local.yaml` that points to the currently hosted vLLM endpoint.
+Set `MODEL_KEY` to the currently hosted model key. Use `--limit 5` or `--limit 10` for the first inspection.
 
 ```bash
-export MODEL_KEY=medgemma   # change to qwen235b, llama4, or the current hosted model key
+export MODEL_KEY=medgemma   # or qwen235b, matching the currently hosted server
+export N_SMOKE=5
 
 python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --roundtrips_csv /path/to/roundtrips.csv \
   --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_provisional_empirical.yaml \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key "$MODEL_KEY" \
-  --output_dir meta_model/outputs/reduced_v1_provisional_roundtrip \
+  --output_dir meta_model/outputs/reduced_v1_smoke \
   --evidence_mode compact \
-  --stage both
+  --stage both \
+  --limit "$N_SMOKE"
+```
 
+Inspect the CSV:
+
+```bash
+column -s, -t < meta_model/outputs/reduced_v1_smoke/${MODEL_KEY}/compact/reduced_v1_roundtrip_outputs.csv | less -S
+```
+
+Then repeat after stopping the current vLLM server and starting the next model:
+
+```text
+1. stop current vLLM server
+2. start the other currently available vLLM model
+3. update MODEL_KEY
+4. rerun the compact smoke test
+5. inspect outputs before running permissive or full tests
+```
+
+Only after compact smoke outputs look reasonable should permissive smoke tests be run:
+
+```bash
 python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --roundtrips_csv /path/to/roundtrips.csv \
   --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_provisional_empirical.yaml \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key "$MODEL_KEY" \
-  --output_dir meta_model/outputs/reduced_v1_provisional_roundtrip \
+  --output_dir meta_model/outputs/reduced_v1_smoke \
   --evidence_mode permissive \
-  --stage both
+  --stage both \
+  --limit "$N_SMOKE"
 ```
 
 Expected output directories:
 
 ```text
-meta_model/outputs/reduced_v1_provisional_roundtrip/<MODEL_KEY>/compact
-meta_model/outputs/reduced_v1_provisional_roundtrip/<MODEL_KEY>/permissive
+meta_model/outputs/reduced_v1_smoke/<MODEL_KEY>/compact
+meta_model/outputs/reduced_v1_smoke/<MODEL_KEY>/permissive
 ```
 
-### C. Repeat model-by-model
+## 7. What to inspect in smoke outputs
 
-After the two modes finish for the current hosted model:
+For each example, check:
 
 ```text
-1. stop current vLLM server
-2. start next model with vLLM
-3. update MODEL_KEY
-4. run compact
-5. run permissive
+1. sentence_decision is sentence/provision-level only.
+2. permit/deny/mixed/unclear are not used as span-level annotations.
+3. decision cues such as “agree” or “allow” are stored in sentence_level_elements.
+4. span-level annotations use only semantic_cluster_C### cluster IDs.
+5. unmatched_language preserves important content not captured by clusters.
+6. interpretation_units explain how clusters combine for reconstruction.
+7. reconstructed_sentence preserves the original meaning without seeing the original sentence.
 ```
 
-The V1 runner is schema-dynamic and reads field names from the YAML, so provisional `semantic_cluster_C###` fields and final audited fields can be evaluated with the same code.
+If the smoke outputs look acceptable, then proceed to broader provisional V1 evaluation.
 
-## 7. Standardize, score, and compare
+## 8. Later full comparison, after smoke tests pass
 
-Use the existing standardization/scoring pipeline, adding only the provisional V1 output directories that have completed under `--reduced_v1_model_dirs`.
+Use the existing standardization/scoring pipeline, adding only completed provisional V1 output directories under `--reduced_v1_model_dirs`.
 
 Compare:
 
@@ -204,7 +237,7 @@ parse success
 residual/unmatched language rate
 ```
 
-## 8. Prepare PI handoff package
+## 9. Prepare PI handoff package
 
 Include:
 
@@ -217,7 +250,7 @@ Include:
 6. semantic_cluster_source_model_heatmap.png
 7. semantic_cluster_network.png
 8. provision_bundle_cluster_network.png
-9. provisional V1 performance comparison vs individual and Union V0
+9. provisional V1 smoke/performance comparison vs individual and Union V0
 10. representative examples where V1 succeeds/fails
 ```
 
@@ -230,7 +263,7 @@ What should each included cluster be named?
 Which source-model distinctions should remain extensions rather than core fields?
 ```
 
-## 9. Build the final audited V1 schema after PI review
+## 10. Build final audited V1 schema after PI review
 
 After auditing `semantic_cluster_audit_template.csv`:
 
@@ -243,8 +276,8 @@ python meta_model/scripts/20_build_reduced_v1_schema_from_audit.py \
   --output_json meta_model/v1_reduced_expert/reduced_metamodel_v1_audited.json
 ```
 
-Then rerun V1 validation with the audited schema, again one hosted vLLM model at a time.
+Then rerun validation with the audited schema, again one hosted vLLM model at a time.
 
 ## Manuscript framing
 
-The reduced V1 meta-model is discovered from expert-validated semantic-equivalence evidence, evaluated once as a provisional data-driven schema, finalized by limited expert audit/naming, and validated on new LLM outputs. A good V1 should approach Union V0 meaning preservation while reducing redundancy and annotation burden, and should outperform individual source models by combining complementary consent-language coverage from DUO, ICO, FHIR Consent, and ODRL.
+The reduced V1 model is discovered from expert-validated semantic-equivalence evidence, smoke-tested as a provisional data-driven cluster dictionary, finalized by limited expert audit/naming, and validated on new LLM outputs. A good V1 should approach Union V0 meaning preservation while reducing redundancy and annotation burden, and should outperform individual source models by combining complementary consent-language coverage from DUO, ICO, FHIR Consent, and ODRL.
