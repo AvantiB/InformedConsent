@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """Run reduced V1 meta-model forward/backward round-trip experiments.
 
-This runner mirrors Union V0: original sentence -> structured JSON -> reconstructed
-sentence from structured JSON only. It supports compact and permissive evidence
-modes using the same reduced schema.
+This runner is schema-dynamic: it reads field names from the supplied V1 YAML.
+That allows both audited V1 schemas and provisional empirical cluster schemas
+(e.g., semantic_cluster_C001) to be evaluated with the same round-trip protocol.
 """
 from __future__ import annotations
 
@@ -32,9 +32,10 @@ except ImportError:
     OpenAI = None  # type: ignore
 
 TEXT_COL_CANDIDATES = ["canonical_full_text", "full_text_original", "original_sentence", "full_text", "sentence", "text"]
-ID_COL_CANDIDATES = ["sentence_id", "source_sentence_id", "roundtrip_id", "id"]
+ID_COL_CANDIDATES = ["sentence_id", "source_sentence_id", "roundtrip_id", "source_id", "id"]
 MASK = "[ORIGINAL_SENTENCE_REMOVED]"
-ROLE_FIELDS = ["decision", "action", "resource", "actor", "recipient_or_grantee", "purpose", "condition", "constraint_or_exception", "temporal_scope", "privacy_identifiability", "choice_structure", "lifecycle_effect", "risk_benefit_or_results", "residual_important_content"]
+NON_LIST_FIELDS = {"decision", "provenance"}
+AUDIT_FIELDS = {"residual_important_content", "provenance"}
 
 
 def norm_text(x: Any) -> str:
@@ -53,7 +54,7 @@ def stable_id(text: str) -> str:
 
 
 def pick_col(df: pd.DataFrame, candidates: list[str], required: bool = True) -> str | None:
-    lower = {c.lower(): c for c in df.columns}
+    lower = {str(c).lower(): c for c in df.columns}
     for cand in candidates:
         if cand.lower() in lower:
             return lower[cand.lower()]
@@ -161,16 +162,24 @@ def extract_json(text: str) -> dict[str, Any]:
     raise ValueError("Could not parse balanced JSON object")
 
 
-def schema_text(schema_path: Path) -> str:
+def load_schema(schema_path: Path) -> tuple[dict[str, Any], str, list[str]]:
     data = yaml.safe_load(schema_path.read_text())
-    lines = [f"Meta-model: {data.get('meta_model_id', 'reduced_consent_metamodel_v1_candidate')}", f"Design goal: {data.get('design_goal', '')}", "", "Fields:"]
-    for f in data.get("fields", []):
+    fields = data.get("fields", []) or []
+    field_names = [str(f.get("name")) for f in fields if f.get("name") and f.get("name") not in {"decision", "provenance"}]
+    lines = [f"Meta-model: {data.get('meta_model_id', 'reduced_consent_metamodel_v1')}", f"Status: {data.get('status', '')}", f"Design goal: {data.get('design_goal', '')}", "", "Fields:"]
+    for f in fields:
         lines.append(f"- {f.get('name')} [{f.get('status', '')}]: {f.get('description', '')}")
+        ev = f.get("selection_evidence") or {}
+        if ev:
+            lines.append(f"  Selection evidence: {json.dumps(ev, ensure_ascii=False)[:800]}")
         support = f.get("source_element_support") or []
         if support:
-            lines.append(f"  Source support examples: {', '.join(str(x) for x in support[:8])}")
+            lines.append(f"  Source support examples: {', '.join(str(x) for x in support[:10])}")
+        spans = f.get("positive_span_examples") or []
+        if spans:
+            lines.append(f"  Positive span examples: {'; '.join(str(x) for x in spans[:8])}")
     lines += ["", "Provision structure:", json.dumps(data.get("provision_structure", {}), ensure_ascii=False, indent=2)]
-    return "\n".join(lines)
+    return data, "\n".join(lines), field_names
 
 
 def evidence_rules(evidence_mode: str, max_evidence_tokens: int) -> str:
@@ -186,53 +195,59 @@ def evidence_rules(evidence_mode: str, max_evidence_tokens: int) -> str:
 - Use the same reduced V1 schema.
 - Evidence_span_text may be a longer phrase or clause when needed to preserve meaning.
 - Do not copy the full sentence verbatim into any single field.
-- Prefer normalized_value plus evidence_span_text; longer evidence is allowed only when it carries condition, exception, temporal, or privacy meaning."""
+- Prefer normalized_value plus evidence_span_text; longer evidence is allowed only when it carries condition, exception, temporal, privacy, or governance meaning."""
     raise ValueError("--evidence_mode must be compact or permissive")
 
 
-def build_forward_messages(sentence: str, schema: str, evidence_mode: str, max_evidence_tokens: int) -> list[dict[str, str]]:
-    system = "You are an NLP annotator for informed-consent documents. Apply the reduced functional meta-model consistently. Return valid JSON only."
+def provision_template(field_names: list[str]) -> str:
+    lines = [
+        '{',
+        '  "provision_id": "p1",',
+        '  "decision": {"value": "permit|deny|obligation|mixed|unclear", "evidence_span_text": "..."},'
+    ]
+    for name in field_names:
+        if name in {"residual_important_content", "provenance"}:
+            continue
+        lines.append(f'  "{name}": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],')
+    lines += [
+        '  "residual_important_content": [{"evidence_span_text": "...", "reason": "why this content matters"}],',
+        '  "provenance": {"source_field_support": ["field names used"], "rationale": "brief rationale"}',
+        '}'
+    ]
+    return "\n".join(lines)
+
+
+def build_forward_messages(sentence: str, schema: str, field_names: list[str], evidence_mode: str, max_evidence_tokens: int) -> list[dict[str, str]]:
+    system = "You are an NLP annotator for informed-consent documents. Apply the supplied reduced functional meta-model consistently. Return valid JSON only."
+    field_list = ", ".join(field_names)
     user = f"""
-Task: map the informed-consent sentence to the reduced V1 functional consent meta-model.
+Task: map the informed-consent sentence to the supplied reduced V1 functional consent meta-model.
 
 Important context:
-- This is a reduced provision-centered schema induced from multiple source information models.
-- The goal is to preserve consent meaning using a smaller set of functional roles.
+- This schema may be an audited V1 or a provisional empirical cluster schema.
+- Use only the provided field names. Do not create new top-level provision fields.
+- For provisional semantic_cluster_C### fields, use the schema descriptions/source examples to decide which cluster best captures each meaning unit.
 - A sentence may contain one or more provisions.
 - Use normalized values wherever possible, with evidence spans for audit.
-- Do not create new top-level fields outside the requested JSON structure.
+
+Allowed provision fields: decision, {field_list}, residual_important_content, provenance
 
 {evidence_rules(evidence_mode, max_evidence_tokens)}
 
 Reduced V1 schema:
 {schema}
 
-Return JSON with exactly this structure:
+Return JSON with exactly this top-level structure:
 {{
   "sentence_decision": "permit|deny|obligation|mixed|unclear",
   "provisions": [
-    {{
-      "provision_id": "p1",
-      "decision": {{"value": "permit|deny|obligation|mixed|unclear", "evidence_span_text": "..."}},
-      "action": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "resource": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "actor": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "recipient_or_grantee": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "purpose": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "condition": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "constraint_or_exception": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "temporal_scope": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "privacy_identifiability": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "choice_structure": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "lifecycle_effect": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "risk_benefit_or_results": [{{"normalized_value": "...", "evidence_span_text": "...", "confidence": "high|medium|low"}}],
-      "residual_important_content": [{{"evidence_span_text": "...", "reason": "why this content matters"}}],
-      "provenance": {{"source_role_support": ["role names used"], "rationale": "brief rationale"}}
-    }}
+{provision_template(field_names)}
   ],
   "unmatched_language": [{{"span_text": "...", "reason": "brief reason"}}],
   "schema_coverage_notes": "brief note"
 }}
+
+Use empty lists for fields that are not present. Use multiple provision objects only when the sentence contains distinct consent provisions.
 
 Sentence:
 {sentence}
@@ -277,7 +292,7 @@ Critical leakage rule:
 - Do not add details not supported by the mapping.
 
 Reconstruction rules:
-- Preserve decision/rule type, action, resource, actor/recipient, purpose, condition, exception/restriction, privacy/identifiability, temporal scope, choice, withdrawal/lifecycle effect, and results/risk meaning when present.
+- Preserve decision/rule type, entities/participants, governed data/specimens/resources, actions, purpose, conditions, exceptions/restrictions, privacy/identifiability, temporal scope, choice, withdrawal/lifecycle effects, and result/risk meaning when present.
 - Include residual_important_content and unmatched_language when needed for meaning preservation.
 - Do not reconstruct by listing field names.
 - Write a natural consent sentence.
@@ -333,42 +348,47 @@ def load_jsonl_by_id(path: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
-def count_role_entries(parsed: dict[str, Any]) -> tuple[int, int]:
+def count_role_entries(parsed: dict[str, Any], field_names: list[str]) -> tuple[int, int]:
     n = 0
     roles = set()
+    fields = ["decision"] + field_names + ["residual_important_content"]
     for prov in parsed.get("provisions") or []:
         if not isinstance(prov, dict):
             continue
-        for role in ROLE_FIELDS:
+        for role in fields:
             val = prov.get(role)
             if role == "decision":
                 if isinstance(val, dict) and (norm_text(val.get("value")) or norm_text(val.get("evidence_span_text"))):
-                    n += 1; roles.add(role)
+                    n += 1
+                    roles.add(role)
                 continue
             if isinstance(val, list):
                 for item in val:
                     if isinstance(item, dict) and any(norm_text(v) for v in item.values()):
-                        n += 1; roles.add(role)
+                        n += 1
+                        roles.add(role)
                     elif norm_text(item):
-                        n += 1; roles.add(role)
+                        n += 1
+                        roles.add(role)
             elif norm_text(val):
-                n += 1; roles.add(role)
+                n += 1
+                roles.add(role)
     return n, len(roles)
 
 
-def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path, evidence_mode: str) -> None:
+def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path, evidence_mode: str, field_names: list[str]) -> None:
     forward = load_jsonl_by_id(forward_path)
     backward = load_jsonl_by_id(backward_path)
     rows = []
     for sid, fwd in forward.items():
         parsed = fwd.get("parsed_forward") or {}
         bwd = backward.get(sid, {})
-        n_entries, n_roles = count_role_entries(parsed if isinstance(parsed, dict) else {})
-        rows.append({"source_id": sid, "source_text": fwd.get("source_text", ""), "evidence_mode": evidence_mode, "sentence_decision": parsed.get("sentence_decision", "") if isinstance(parsed, dict) else "", "n_role_entries": n_entries, "n_unique_roles": n_roles, "forward_parse_ok": fwd.get("parse_ok", False), "backward_parse_ok": bwd.get("parse_ok", False), "reconstructed_sentence": (bwd.get("parsed_backward") or {}).get("reconstructed_sentence", ""), "v1_mapping_json": json.dumps(parsed, ensure_ascii=False), "backward_packet_json": json.dumps(bwd.get("backward_packet", {}), ensure_ascii=False), "forward_raw": fwd.get("raw_response", ""), "backward_raw": bwd.get("raw_response", "")})
+        n_entries, n_roles = count_role_entries(parsed if isinstance(parsed, dict) else {}, field_names)
+        rows.append({"source_id": sid, "source_text": fwd.get("source_text", ""), "evidence_mode": evidence_mode, "schema_fields_json": json.dumps(field_names, ensure_ascii=False), "sentence_decision": parsed.get("sentence_decision", "") if isinstance(parsed, dict) else "", "n_role_entries": n_entries, "n_unique_roles": n_roles, "forward_parse_ok": fwd.get("parse_ok", False), "backward_parse_ok": bwd.get("parse_ok", False), "reconstructed_sentence": (bwd.get("parsed_backward") or {}).get("reconstructed_sentence", ""), "v1_mapping_json": json.dumps(parsed, ensure_ascii=False), "backward_packet_json": json.dumps(bwd.get("backward_packet", {}), ensure_ascii=False), "forward_raw": fwd.get("raw_response", ""), "backward_raw": bwd.get("raw_response", "")})
     pd.DataFrame(rows).to_csv(out_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 
 
-def run_forward(rows: pd.DataFrame, client: Any, model_cfg: dict[str, Any], schema: str, evidence_mode: str, max_evidence_tokens: int, out_dir: Path) -> None:
+def run_forward(rows: pd.DataFrame, client: Any, model_cfg: dict[str, Any], schema: str, field_names: list[str], evidence_mode: str, max_evidence_tokens: int, out_dir: Path) -> None:
     forward_path = out_dir / "reduced_v1_forward_mappings.jsonl"
     failures_path = out_dir / "failed_requests.jsonl"
     done = read_done(forward_path)
@@ -378,11 +398,11 @@ def run_forward(rows: pd.DataFrame, client: Any, model_cfg: dict[str, Any], sche
             continue
         sent = str(row["_source_text"])
         try:
-            raw = call_chat(client, model_cfg, build_forward_messages(sent, schema, evidence_mode, max_evidence_tokens))
+            raw = call_chat(client, model_cfg, build_forward_messages(sent, schema, field_names, evidence_mode, max_evidence_tokens))
             parsed = extract_json(raw)
             append_jsonl(forward_path, {"source_id": sid, "source_text": sent, "model_key": model_cfg["model_key"], "model": model_cfg.get("model", model_cfg["model_key"]), "condition": f"reduced_v1_{evidence_mode}", "evidence_mode": evidence_mode, "stage": "forward", "parse_ok": True, "parsed_forward": parsed, "raw_response": raw})
             done.add(sid)
-            n_entries, n_roles = count_role_entries(parsed)
+            n_entries, n_roles = count_role_entries(parsed, field_names)
             print(f"[V1 {evidence_mode} forward] {i + 1}/{len(rows)} ok {sid} role_entries={n_entries} roles={n_roles}")
         except Exception as exc:
             append_jsonl(failures_path, {"stage": "forward", "source_id": sid, "source_text": sent, "error": repr(exc), "evidence_mode": evidence_mode})
@@ -432,14 +452,14 @@ def main() -> None:
     rows = load_rows(Path(args.roundtrips_csv), args.limit, args.no_dedupe_sentences)
     model_cfg = load_model_config(Path(args.model_config_yaml), args.model_key)
     client = make_client(model_cfg)
-    schema = schema_text(Path(args.metamodel_yaml))
+    _, schema, field_names = load_schema(Path(args.metamodel_yaml))
     out_dir = Path(args.output_dir) / args.model_key / args.evidence_mode
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.stage in {"forward", "both"}:
-        run_forward(rows, client, model_cfg, schema, args.evidence_mode, args.max_evidence_tokens, out_dir)
+        run_forward(rows, client, model_cfg, schema, field_names, args.evidence_mode, args.max_evidence_tokens, out_dir)
     if args.stage in {"backward", "both"}:
         run_backward(rows, client, model_cfg, schema, args.evidence_mode, out_dir)
-    write_roundtrip_csv(out_dir / "reduced_v1_forward_mappings.jsonl", out_dir / "reduced_v1_backward_reconstructions.jsonl", out_dir / "reduced_v1_roundtrip_outputs.csv", args.evidence_mode)
+    write_roundtrip_csv(out_dir / "reduced_v1_forward_mappings.jsonl", out_dir / "reduced_v1_backward_reconstructions.jsonl", out_dir / "reduced_v1_roundtrip_outputs.csv", args.evidence_mode, field_names)
     print(f"Wrote V1 outputs under {out_dir}")
 
 
