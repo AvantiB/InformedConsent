@@ -1,4 +1,4 @@
-# Reduced V1 meta-model induction and validation runbook
+# Reduced V1 meta-model discovery, audit, and validation runbook
 
 This is the authoritative runbook for the reduced V1 informed-consent meta-model.
 
@@ -7,28 +7,23 @@ This is the authoritative runbook for the reduced V1 informed-consent meta-model
 Reduced V1 is derived from the original expert-evaluated round-trip dataset, not from the new MedGemma/Qwen/Llama/GPT outputs.
 
 ```text
-Derivation / induction corpus:
+Derivation / discovery corpus:
   original researcher annotation workbooks with expert meaning-preservation labels
 
 Validation / stress-test corpus:
   new MedGemma, Qwen235B, Llama4, GPT-5.5 round-trip outputs
 ```
 
-Expert-preserved rows are treated as functionally validated positive evidence: the forward representation contained enough information to reconstruct the original sentence meaning. Expert-failed rows are boundary evidence: they weaken proposed merges and flag unsafe simplifications.
+Expert-preserved rows are positive functional evidence. Expert-failed rows are boundary evidence. New LLM outputs are used only after V1 is defined, to test generalization.
 
-## Comparable V1 round-trip evaluation
+## Important methodological correction
 
-Reduced V1 keeps the same basic evaluation structure as Union V0:
+V1 is **not** induced by hard-coding fields such as action/resource/actor. The workflow separates two empirical graphs:
 
-```text
-original sentence -> structured JSON
-structured JSON only -> reconstructed sentence
-```
+1. **Semantic-equivalence graph**: asks which source-model elements may express the same semantic field. Edges come from same/overlapping evidence spans, cross-information-model support, cross-LLM support, expert-positive evidence, and profile similarity.
+2. **Provision-bundle graph**: asks which elements co-occur compositionally in consent sentences. This graph is used to understand provision structure, not to merge fields.
 
-Run both V1 evidence variants using the same schema:
-
-1. `compact`: short evidence phrases only.
-2. `permissive`: same schema, but longer evidence phrases are allowed when needed to preserve condition, exception, temporal, or privacy meaning.
+The final V1 schema is not generated directly by script 17. Script 17 writes empirical clusters and an audit template. Humans only name/select clusters and flag unsafe merges/splits. Script 20 then converts the audited cluster table into the V1 YAML schema.
 
 ## 1. Pull and compile
 
@@ -36,21 +31,14 @@ Run both V1 evidence variants using the same schema:
 git pull origin main
 
 python -m py_compile meta_model/scripts/12_build_expert_roundtrip_corpus.py
-python -m py_compile meta_model/scripts/07_standardize_roundtrip_outputs.py
-python -m py_compile meta_model/scripts/16_audit_annotation_granularity.py
 python -m py_compile meta_model/scripts/17_induce_reduced_v1_metamodel.py
+python -m py_compile meta_model/scripts/20_build_reduced_v1_schema_from_audit.py
 python -m py_compile meta_model/scripts/18_run_reduced_v1_roundtrip.py
 ```
 
 ## 2. Build the clean expert round-trip corpus
 
-Use the original researcher handoff workbooks. The corpus builder reads the workbook columns:
-
-```text
-source_file, ID, full_text, annotations_combined, backward_mapping, Results/results, Notes
-```
-
-It produces a normalized CSV with one row per source sentence / information model / LLM workbook row. It also parses `annotations_combined` into `annotations_json`, which is the clean input used by the V1 induction script.
+Use the original researcher handoff workbooks.
 
 ```bash
 python meta_model/scripts/12_build_expert_roundtrip_corpus.py \
@@ -58,85 +46,93 @@ python meta_model/scripts/12_build_expert_roundtrip_corpus.py \
   --output_csv meta_model/outputs/expert_roundtrips_clean.csv
 ```
 
-Check the corpus summary:
+Check:
 
 ```bash
 cat meta_model/outputs/expert_roundtrip_corpus_summary.json
 column -s, -t < meta_model/outputs/expert_roundtrip_corpus_summary.csv | less -S
 ```
 
-Important: raw repeated annotations are retained in the clean corpus. Frequency within a sentence, across LLMs, and across information models is evidence for salience. Later graph-edge construction counts co-occurrence at the context level so repeated labels in one row do not create artificial Cartesian-product edge inflation.
+Raw repeated annotations are retained as salience/frequency evidence.
 
-## 3. Induce Reduced V1 from the clean expert corpus
+## 3. Discover empirical V1 evidence
 
 ```bash
 python meta_model/scripts/17_induce_reduced_v1_metamodel.py \
   --expert_roundtrips_csv meta_model/outputs/expert_roundtrips_clean.csv \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
   --output_dir meta_model/v1_reduced_expert \
-  --min_edge_weight 0.22 \
+  --min_semantic_edge_weight 0.28 \
+  --span_overlap_jaccard 0.50 \
   --min_core_positive_sentences 15
 ```
 
-If the label column is not auto-detected:
-
-```bash
-python meta_model/scripts/17_induce_reduced_v1_metamodel.py \
-  --expert_roundtrips_csv meta_model/outputs/expert_roundtrips_clean.csv \
-  --label_col meaning_preserved \
-  --inventory_csv meta_model/v0_union/source_element_inventory.csv \
-  --output_dir meta_model/v1_reduced_expert
-```
-
-## 4. Evidence outputs from induction
+Key outputs:
 
 ```text
-meta_model/v1_reduced_expert/expert_element_mentions_long.csv
-meta_model/v1_reduced_expert/expert_sentence_level_decision_mentions_long.csv
-meta_model/v1_reduced_expert/expert_element_profiles.csv
-meta_model/v1_reduced_expert/expert_element_relationship_edges.csv
-meta_model/v1_reduced_expert/expert_element_clusters.csv
-meta_model/v1_reduced_expert/expert_cluster_evidence_summary.csv
-meta_model/v1_reduced_expert/expert_sentence_level_decision_summary.csv
-meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.yaml
-meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.md
-meta_model/v1_reduced_expert/expert_validated_induction_methodology.md
+expert_element_mentions_long.csv
+expert_element_profiles.csv
+semantic_equivalence_edges.csv
+semantic_equivalence_clusters.csv
+semantic_cluster_evidence_summary.csv
+semantic_cluster_audit_template.csv
+provision_bundle_edges.csv
+provision_bundle_summary_by_semantic_cluster.csv
+expert_sentence_level_decision_summary.csv
+expert_v1_discovery_methodology.md
+semantic_cluster_discovery_report.md
 ```
 
-## 5. Methodology implemented by script 17
+Interpretation:
 
-1. Parse clean `annotations_json` into source-element mentions.
-2. Separate sentence-level decision fields: `DUO.decision`, `ICO.decision`, `ODRL::Rule_TestSentence`, and `FHIR_Consent::Consent.provision.type`.
-3. Treat annotations from expert-preserved rows as positive functional evidence.
-4. Treat annotations from expert-failed rows as boundary/failure evidence.
-5. Build source-element profiles containing raw mention counts, sentence coverage, LLM support, information-model support, positive rate, and span examples.
-6. Build weighted graph edges from expert-positive co-occurrence by source sentence / LLM / information model context, same-span expert-positive use, label/definition/span similarity, and cross-source-model support.
-7. Penalize edges when the same element pair occurs mainly in expert-failed rows.
-8. Cluster the weighted graph.
-9. Select clusters as `core_shared`, `context_module`, `audit_or_extension`, or `failure_boundary_audit`.
-10. Generate the candidate Reduced V1 YAML schema with field-level selection evidence.
-
-UMAP may be added later for visualization only. It is not the primary grouping method.
-
-## 6. Audit before running V1
-
-```bash
-less meta_model/v1_reduced_expert/expert_validated_induction_methodology.md
-less meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.md
-head -30 meta_model/v1_reduced_expert/expert_cluster_evidence_summary.csv
-head -30 meta_model/v1_reduced_expert/expert_element_relationship_edges.csv
+```text
+semantic_equivalence_edges/clusters = candidate field merges
+provision_bundle_edges = composition/co-occurrence, not merge evidence
+semantic_cluster_audit_template.csv = the file to audit/name before schema creation
 ```
 
-This audit is for unsafe merges, bad names, or parsing failures. It is not manual schema design.
+## 4. Audit semantic clusters
 
-## 7. Smoke-test Reduced V1 compact and permissive variants
+Open:
 
 ```bash
-rm -rf meta_model/outputs/reduced_v1_roundtrip_smoke/mayo_gpt55
+column -s, -t < meta_model/v1_reduced_expert/semantic_cluster_audit_template.csv | less -S
+less meta_model/v1_reduced_expert/semantic_cluster_discovery_report.md
+```
 
+Fill these columns in `semantic_cluster_audit_template.csv`:
+
+```text
+include_in_v1        yes/no
+final_field_name     audited field name, e.g., resource, purpose, temporal_scope
+audit_decision       keep / split / merge_with_Cxx / exclude
+unsafe_merge_notes   why a merge is unsafe, if applicable
+split_or_merge_notes notes for downstream schema construction
+```
+
+This is the human audit/naming step, not manual schema design. Cluster membership and support are data-derived.
+
+## 5. Build the audited V1 schema
+
+After auditing the template:
+
+```bash
+python meta_model/scripts/20_build_reduced_v1_schema_from_audit.py \
+  --audit_csv meta_model/v1_reduced_expert/semantic_cluster_audit_template.csv \
+  --clusters_csv meta_model/v1_reduced_expert/semantic_equivalence_clusters.csv \
+  --decision_summary_csv meta_model/v1_reduced_expert/expert_sentence_level_decision_summary.csv \
+  --output_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_audited.yaml \
+  --output_json meta_model/v1_reduced_expert/reduced_metamodel_v1_audited.json
+```
+
+The schema builder will fail if no clusters are explicitly selected with `include_in_v1=yes` and `final_field_name` filled in.
+
+## 6. Smoke-test Reduced V1 compact/permissive variants
+
+```bash
 python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --roundtrips_csv /path/to/roundtrips.csv \
-  --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.yaml \
+  --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_audited.yaml \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key mayo_gpt55 \
   --output_dir meta_model/outputs/reduced_v1_roundtrip_smoke \
@@ -146,7 +142,7 @@ python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
 
 python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --roundtrips_csv /path/to/roundtrips.csv \
-  --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.yaml \
+  --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_audited.yaml \
   --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
   --model_key mayo_gpt55 \
   --output_dir meta_model/outputs/reduced_v1_roundtrip_smoke \
@@ -155,36 +151,10 @@ python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
   --limit 3
 ```
 
-## 8. Full Reduced V1 validation runs
+## 7. Full validation
 
-Run both evidence modes for each validation model.
-
-```bash
-for MODEL in medgemma qwen235b llama4 mayo_gpt55; do
-  for MODE in compact permissive; do
-    python meta_model/scripts/18_run_reduced_v1_roundtrip.py \
-      --roundtrips_csv /path/to/roundtrips.csv \
-      --metamodel_yaml meta_model/v1_reduced_expert/reduced_metamodel_v1_candidate.yaml \
-      --model_config_yaml meta_model/configs/union_v0_models.local.yaml \
-      --model_key "$MODEL" \
-      --output_dir meta_model/outputs/reduced_v1_roundtrip \
-      --evidence_mode "$MODE" \
-      --stage both
-  done
-done
-```
-
-## 9. Standardize, score, and audit validation outputs
-
-After Reduced V1 validation runs, use the existing standardization, scoring, round-trip analysis, and annotation-granularity audit scripts to compare:
-
-```text
-individual source-model prompts
-Union V0 full dictionary
-Reduced V1 compact
-Reduced V1 permissive
-```
+Run both evidence modes for each validation model, then standardize, score, and compare against individual-model and Union V0 baselines as before.
 
 ## Manuscript framing
 
-The reduced V1 meta-model is induced from expert-validated evidence. New LLM outputs are validation conditions. A successful V1 does not need to beat Union V0 on every raw score; it should preserve meaning better than individual source models and approach Union V0 while reducing annotation burden, redundancy, and model-dependent verbosity.
+The reduced V1 meta-model is discovered from expert-validated semantic-equivalence evidence, finalized by limited audit/naming, and validated on new LLM outputs. A good V1 should approach Union V0 meaning preservation while reducing redundancy and annotation burden.
