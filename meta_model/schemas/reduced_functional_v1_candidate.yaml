@@ -5,4 +5,140 @@ derivation_note: >-
   analysis of expert-preserved round-trip annotations. Final names, boundaries, and
   inclusion decisions require PI/domain-expert review before paper-facing use.
 annotation_policy:
-  sentence_decision: provision-level only;
+  sentence_decision: provision-level only; do not use permit/deny as span-level labels.
+  atomic_spans: prefer the smallest contiguous phrase that expresses one semantic function.
+  multi_label: allowed only when the same text span truly expresses multiple functions.
+  residual: use residual_important_content for meaning-critical text outside the schema.
+  provenance: preserve sentence, form, span text, field, model, and fold metadata.
+sentence_decision:
+  scope: sentence_or_provision_level
+  allowed_values:
+    - permit
+    - deny
+    - obligation
+    - mixed
+    - unclear
+fields:
+  - name: decision_cue_or_consent_act
+    status: core
+    definition: Textual cue expressing agreement, authorization, permission, refusal, or choice.
+    include: [agree, give permission, authorize, allow, choose, say no, decline, consent]
+    exclude: [synthetic annotation markers such as '(permit)' or '(deny)']
+    data_seed: permission/agree/allow/authorize clusters and sentence-level decision-cue evidence.
+  - name: participant_or_subject
+    status: core
+    definition: Person whose participation, data, samples, records, rights, or choices are governed.
+    include: [you, I, participant, your child, my child, subject]
+    exclude: [researchers acting on data, institutions, repositories]
+    data_seed: person/pronoun and subject-like clusters across FHIR, ICO, ODRL, and DUO evidence.
+  - name: authorized_actor
+    status: core
+    definition: Person or group permitted, prohibited, or obligated to perform an action.
+    include: [researchers, study team, investigator, doctor, research staff, approved researchers]
+    exclude: [participant as subject, repository as storage location]
+    data_seed: researcher/study-team/doctor actor clusters and action co-occurrence bundles.
+  - name: institution_or_custodian
+    status: core
+    definition: Organization responsible for governance, custody, study conduct, or institutional control.
+    include: [Mayo Clinic, All of Us, Cincinnati Children's, KP Research Bank, UT Southwestern]
+    exclude: [database or registry when used as storage/access location]
+    data_seed: institution/program/custodian clusters; separated from repositories because co-occurrence showed complementary roles.
+  - name: repository_or_registry
+    status: core
+    definition: Storage, registry, database, biobank, or repository location where data/samples are held or accessed.
+    include: [database, registry, biobank, tissue bank, All of Us databases, research repository]
+    exclude: [institution governing the study when not used as a storage/access location]
+    data_seed: biobank/registry/database clusters and storage-location co-occurrence with resource/action fields.
+  - name: governed_resource
+    status: core
+    definition: Object governed by consent, including data, samples, specimens, records, results, or biospecimens.
+    include: [blood, urine, saliva, DNA, samples, specimens, health information, medical records, data, results]
+    exclude: [action performed on the resource, purpose of use]
+    data_seed: samples/data/records/health-information clusters recurring across all folds.
+  - name: governed_action
+    status: core
+    definition: Action being permitted, denied, requested, obligated, or described.
+    include: [collect, store, use, share, disclose, access, destroy, return, contact, donate, participate]
+    exclude: [sentence-level decision value, actor, resource]
+    data_seed: use/share/disclose/store/access/action clusters and source action elements.
+  - name: purpose_or_use_context
+    status: core
+    definition: Reason, use context, or purpose for which a governed action/resource is used.
+    include: [for research, future research, clinical purposes, public health purposes, to learn more]
+    exclude: [disease/topic alone when it functions as research domain]
+    data_seed: research/future-research/purpose clusters and FHIR/DUO purpose-like elements.
+  - name: research_domain_or_study_topic
+    status: extension
+    definition: Disease, condition, study topic, or domain that scopes the research purpose.
+    include: [cancer, Smith-Magenis Syndrome, hearing loss, ADRD, bariatric surgery]
+    exclude: [general phrase 'for research' without a domain/topic]
+    data_seed: disease/topic-specific clusters that were recurrent but should not be merged with purpose/action.
+  - name: temporal_scope
+    status: core
+    definition: Time, duration, timing, expiration, or temporal boundary of a provision.
+    include: [at any time, indefinitely, no expiration date, until FDA approval, when you turn 18, after withdrawal]
+    exclude: [the entity/action that the temporal phrase modifies]
+    data_seed: expiration/duration/until/indefinitely/age-at-majority clusters.
+  - name: temporal_target
+    status: core
+    definition: The consent function modified by a temporal phrase.
+    include_values: [study_duration, data_storage_duration, permission_duration, withdrawal_timing, future_use, access_duration, unspecified]
+    exclude: [the temporal phrase itself when not indicating attachment]
+    data_seed: relationship errors showed that duration must be attached to the correct entity/action.
+  - name: condition_or_exception
+    status: core
+    definition: Conditional, exception, or scope-trigger language that changes when a provision applies.
+    include: [if you agree, unless permission is withdrawn, except as required by law, only if, before you withdraw]
+    exclude: [simple temporal phrases without condition/exception force]
+    data_seed: constraint/exception clusters and co-occurrence with actions/resources.
+  - name: restriction_or_prohibition
+    status: core
+    definition: Negative rule, restriction, limitation, or prohibition span.
+    include: [will not be shared, may not disclose, cannot access, not used for, except as authorized by law]
+    exclude: [sentence_decision=deny by itself]
+    data_seed: prohibition/negative-action clusters and deny/restriction evidence.
+  - name: choice_or_withdrawal_right
+    status: core
+    definition: Participant right or choice to refuse, withdraw, stop participation, request removal, or say no.
+    include: [you can withdraw, say no, stop taking part, withdraw your permission, remove your samples]
+    exclude: [generic action when no participant choice/right is expressed]
+    data_seed: withdraw/say-no/stop-taking-part clusters and informed-consent right evidence.
+  - name: privacy_or_identifiability
+    status: core
+    definition: Privacy, confidentiality, identifiability, de-identification, coding, or anonymization status.
+    include: [de-identified, identifiable, confidential, private, coded, anonymous, without your name]
+    exclude: [resource mention without privacy status]
+    data_seed: identifiable/de-identified/security-label clusters.
+  - name: study_or_data_lifecycle
+    status: core
+    definition: Lifecycle status or event for study, data, samples, specimens, permission, or existing work.
+    include: [study will last, already begun, data already collected, leftover specimens, future procedures, samples destroyed]
+    exclude: [bare action unless it indicates lifecycle state]
+    data_seed: lifecycle/destroyed/already-begun/leftover/future-procedure clusters.
+  - name: consequence_or_protection
+    status: core
+    definition: Effect, protection, assurance, penalty, care impact, or consequence of a choice/provision.
+    include: [will not affect your care, may affect medical care, still receive care, no penalty, benefits will not change]
+    exclude: [clinical-care phrase when not consequence/protection]
+    data_seed: care-impact/protection/consequence clusters and common reconstruction-loss category.
+  - name: return_of_results_or_feedback
+    status: extension
+    definition: Return, receipt, non-return, or communication of study, clinical, or genetic results.
+    include: [return the results, hearing about results, results to you and your doctor, will not receive results]
+    exclude: [resource 'results' when no return/feedback action is expressed]
+    data_seed: result-return clusters; separable from generic resource/action in many forms.
+  - name: contact_or_request
+    status: extension
+    definition: Contact, ask, notify, request, or communication act.
+    include: [contact you, ask you, request, make such a request, notify]
+    exclude: [decision cue 'ask permission' when better captured as consent act]
+    data_seed: ask/request/contact clusters.
+  - name: residual_important_content
+    status: safety
+    definition: Meaning-critical span that does not fit any current field and should be preserved for review.
+    include: [unmodeled but meaning-critical language]
+    exclude: [non-meaningful boilerplate]
+    data_seed: needed to avoid forced unsafe mappings.
+provenance:
+  required: true
+  fields: [form_id, sentence_id, span_text, field_name, sentence_decision, model, information_model, fold_id]
