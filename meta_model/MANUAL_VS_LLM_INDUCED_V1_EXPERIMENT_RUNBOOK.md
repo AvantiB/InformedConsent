@@ -21,6 +21,39 @@ Manual Functional V1 and LLM-Induced Functional V1: same script, same prompt, sa
 
 The LLM induction prompt is separate because schema induction is a different task.
 
+## Model-key convention
+
+Use the exact keys present in `meta_model/configs/union_v0_models.local.yaml`.
+
+For Mayo GPT-5.5, the template key is:
+
+```text
+mayo_gpt55
+```
+
+Use `--model_key mayo_gpt55`, not `gpt55`, unless your local YAML explicitly defines a separate `gpt55` alias.
+
+The Mayo Apigee wrapper can read credentials in two modes:
+
+```text
+OAuth auto-refresh:
+  configure oauth_client_id_env and oauth_client_secret_env in the local YAML.
+
+Static/refreshed bearer token:
+  configure APIGEE_TOKEN_FILE or APIGEE_TOKEN.
+  The wrapper reads the token file/env during requests, but token creation/refresh is external unless OAuth is configured.
+```
+
+## One hosted model at a time
+
+For local vLLM models, run only the model that is currently hosted. Do not run the all-model loops unless all endpoints are actually available. Use the single-model command blocks below and set:
+
+```bash
+export RUN_MODEL=medgemma      # or qwen235b, llama4, mayo_gpt55, etc.
+```
+
+For Mayo GPT-5.5, no local vLLM hosting is needed, but the Apigee token/OAuth configuration must be valid.
+
 ## A. Preparation
 
 ```bash
@@ -122,18 +155,12 @@ python meta_model/scripts/25_make_heldout_roundtrips.py \
 
 ## C. Build source-model crosswalk and evidence cards
 
-Build crosswalk from source elements to manual Functional V1 fields:
-
 ```bash
 python meta_model/scripts/26_build_functional_v1_crosswalk.py \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
   --schema_yaml meta_model/schemas/reduced_functional_v1_candidate.yaml \
   --output_dir meta_model/functional_v1/crosswalk
-```
 
-Build LLM-induction evidence cards from fold-selected neighborhoods:
-
-```bash
 python meta_model/scripts/28_build_llm_schema_induction_cards.py \
   --fold_root meta_model/refined_cv \
   --selected_fields_csv meta_model/refined_cv/field_selection_strict/selected_fields_long.csv \
@@ -151,59 +178,69 @@ Manual schema:
 meta_model/schemas/reduced_functional_v1_candidate.yaml
 ```
 
-Smoke test first:
+Smoke test first with the currently available/hosted model:
 
 ```bash
+export RUN_MODEL=medgemma
+
 python meta_model/scripts/27_run_functional_v1_roundtrip.py \
   --roundtrips_csv meta_model/refined_cv/fold_00/heldout_roundtrips.csv \
   --metamodel_yaml meta_model/schemas/reduced_functional_v1_candidate.yaml \
   --model_config_yaml "$MODEL_CONFIG" \
-  --model_key medgemma \
+  --model_key "$RUN_MODEL" \
   --output_dir "$OUT_ROOT/manual_v1/fold_00" \
   --evidence_mode compact \
   --stage both \
   --limit 20
 
 python meta_model/scripts/30_relabel_functional_v1_outputs.py \
-  --output_dir "$OUT_ROOT/manual_v1/fold_00/medgemma/compact" \
+  --output_dir "$OUT_ROOT/manual_v1/fold_00/${RUN_MODEL}/compact" \
   --condition functional_v1_manual \
   --information_model Functional_V1_Manual
 ```
 
-Full manual V1 held-out evaluation:
+Full manual V1 held-out evaluation for one currently hosted model:
 
 ```bash
-for FOLD in 0 1 2 3; do
-  for MODEL in medgemma qwen235b llama4 gpt55; do
-    python meta_model/scripts/27_run_functional_v1_roundtrip.py \
-      --roundtrips_csv meta_model/refined_cv/fold_0${FOLD}/heldout_roundtrips.csv \
-      --metamodel_yaml meta_model/schemas/reduced_functional_v1_candidate.yaml \
-      --model_config_yaml "$MODEL_CONFIG" \
-      --model_key "$MODEL" \
-      --output_dir "$OUT_ROOT/manual_v1/fold_0${FOLD}" \
-      --evidence_mode compact \
-      --stage both
+export RUN_MODEL=medgemma
 
-    python meta_model/scripts/30_relabel_functional_v1_outputs.py \
-      --output_dir "$OUT_ROOT/manual_v1/fold_0${FOLD}/${MODEL}/compact" \
-      --condition functional_v1_manual \
-      --information_model Functional_V1_Manual
-  done
+for FOLD in 0 1 2 3; do
+  python meta_model/scripts/27_run_functional_v1_roundtrip.py \
+    --roundtrips_csv meta_model/refined_cv/fold_0${FOLD}/heldout_roundtrips.csv \
+    --metamodel_yaml meta_model/schemas/reduced_functional_v1_candidate.yaml \
+    --model_config_yaml "$MODEL_CONFIG" \
+    --model_key "$RUN_MODEL" \
+    --output_dir "$OUT_ROOT/manual_v1/fold_0${FOLD}" \
+    --evidence_mode compact \
+    --stage both
+
+  python meta_model/scripts/30_relabel_functional_v1_outputs.py \
+    --output_dir "$OUT_ROOT/manual_v1/fold_0${FOLD}/${RUN_MODEL}/compact" \
+    --condition functional_v1_manual \
+    --information_model Functional_V1_Manual
 done
 ```
 
-## E. LLM-induced schema generation with GPT-5.5
+Repeat this block after hosting each model by changing `RUN_MODEL`.
 
-Use one fixed strong induction model for schema induction, ideally GPT-5.5 Thinking. Do not use the manual V1 schema as an induction input.
+## E. LLM-induced schema generation with Mayo GPT-5.5
 
-Fold-specific induction:
+Use one fixed strong induction model for schema induction. For the Mayo Apigee GPT-5.5 config, use:
 
 ```bash
+export INDUCTION_MODEL=mayo_gpt55
+```
+
+Do not use the manual V1 schema as an induction input.
+
+```bash
+export INDUCTION_MODEL=mayo_gpt55
+
 for FOLD in 0 1 2 3; do
   python meta_model/scripts/29_induce_functional_schema_with_llm.py \
     --evidence_cards_jsonl meta_model/functional_v1/llm_induction_cards/fold_0${FOLD}/schema_induction_evidence_cards.jsonl \
     --model_config_yaml "$MODEL_CONFIG" \
-    --model_key gpt55 \
+    --model_key "$INDUCTION_MODEL" \
     --output_dir meta_model/functional_v1/llm_induced/fold_0${FOLD} \
     --stage all \
     --target_min_fields 16 \
@@ -230,46 +267,50 @@ meta_model/functional_v1/llm_induced/fold_XX/llm_induced_functional_v1_candidate
 
 ## F. LLM-induced Functional V1 round-trip assessment
 
-Smoke test one fold first:
+Smoke test one fold with the currently available/hosted model:
 
 ```bash
+export RUN_MODEL=medgemma
+
 python meta_model/scripts/27_run_functional_v1_roundtrip.py \
   --roundtrips_csv meta_model/refined_cv/fold_00/heldout_roundtrips.csv \
   --metamodel_yaml meta_model/functional_v1/llm_induced/fold_00/llm_induced_functional_v1_candidate.yaml \
   --model_config_yaml "$MODEL_CONFIG" \
-  --model_key medgemma \
+  --model_key "$RUN_MODEL" \
   --output_dir "$OUT_ROOT/llm_induced_v1/fold_00" \
   --evidence_mode compact \
   --stage both \
   --limit 20
 
 python meta_model/scripts/30_relabel_functional_v1_outputs.py \
-  --output_dir "$OUT_ROOT/llm_induced_v1/fold_00/medgemma/compact" \
+  --output_dir "$OUT_ROOT/llm_induced_v1/fold_00/${RUN_MODEL}/compact" \
   --condition functional_v1_llm_induced \
   --information_model Functional_V1_LLM_Induced
 ```
 
-Full LLM-induced V1 held-out evaluation:
+Full LLM-induced V1 held-out evaluation for one currently hosted model:
 
 ```bash
-for FOLD in 0 1 2 3; do
-  for MODEL in medgemma qwen235b llama4 gpt55; do
-    python meta_model/scripts/27_run_functional_v1_roundtrip.py \
-      --roundtrips_csv meta_model/refined_cv/fold_0${FOLD}/heldout_roundtrips.csv \
-      --metamodel_yaml meta_model/functional_v1/llm_induced/fold_0${FOLD}/llm_induced_functional_v1_candidate.yaml \
-      --model_config_yaml "$MODEL_CONFIG" \
-      --model_key "$MODEL" \
-      --output_dir "$OUT_ROOT/llm_induced_v1/fold_0${FOLD}" \
-      --evidence_mode compact \
-      --stage both
+export RUN_MODEL=medgemma
 
-    python meta_model/scripts/30_relabel_functional_v1_outputs.py \
-      --output_dir "$OUT_ROOT/llm_induced_v1/fold_0${FOLD}/${MODEL}/compact" \
-      --condition functional_v1_llm_induced \
-      --information_model Functional_V1_LLM_Induced
-  done
+for FOLD in 0 1 2 3; do
+  python meta_model/scripts/27_run_functional_v1_roundtrip.py \
+    --roundtrips_csv meta_model/refined_cv/fold_0${FOLD}/heldout_roundtrips.csv \
+    --metamodel_yaml meta_model/functional_v1/llm_induced/fold_0${FOLD}/llm_induced_functional_v1_candidate.yaml \
+    --model_config_yaml "$MODEL_CONFIG" \
+    --model_key "$RUN_MODEL" \
+    --output_dir "$OUT_ROOT/llm_induced_v1/fold_0${FOLD}" \
+    --evidence_mode compact \
+    --stage both
+
+  python meta_model/scripts/30_relabel_functional_v1_outputs.py \
+    --output_dir "$OUT_ROOT/llm_induced_v1/fold_0${FOLD}/${RUN_MODEL}/compact" \
+    --condition functional_v1_llm_induced \
+    --information_model Functional_V1_LLM_Induced
 done
 ```
+
+Repeat this block after hosting each model by changing `RUN_MODEL`.
 
 ## G. Baseline outputs: individual models and Union V0
 
@@ -284,20 +325,15 @@ meta_model/outputs/union_v0_roundtrip/<model_key>
 
 ## H. Standardize all conditions for scoring
 
-Build comma-separated directory lists:
+Build comma-separated directory lists from whatever model outputs exist:
 
 ```bash
-INDIV_DIRS=$(printf "meta_model/outputs/individual_model_roundtrip/%s," medgemma qwen235b llama4 gpt55 | sed 's/,$//')
-UNION_DIRS=$(printf "meta_model/outputs/union_v0_roundtrip/%s," medgemma qwen235b llama4 gpt55 | sed 's/,$//')
-
+INDIV_DIRS=$(find meta_model/outputs/individual_model_roundtrip -mindepth 1 -maxdepth 1 -type d | paste -sd, -)
+UNION_DIRS=$(find meta_model/outputs/union_v0_roundtrip -mindepth 1 -maxdepth 1 -type d | paste -sd, -)
 MANUAL_DIRS=$(find "$OUT_ROOT/manual_v1" -path "*/compact" -type d | paste -sd, -)
 LLM_INDUCED_DIRS=$(find "$OUT_ROOT/llm_induced_v1" -path "*/compact" -type d | paste -sd, -)
 REDUCED_DIRS="${MANUAL_DIRS},${LLM_INDUCED_DIRS}"
-```
 
-Standardize:
-
-```bash
 python meta_model/scripts/07_standardize_roundtrip_outputs.py \
   --individual_model_dirs "$INDIV_DIRS" \
   --union_model_dirs "$UNION_DIRS" \
