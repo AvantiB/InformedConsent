@@ -2,7 +2,7 @@
 """Induce a Reduced Functional V1 schema from evidence cards using one fixed LLM.
 
 This is the LLM-induced schema arm. It should be run with a single strong
-induction model (for example GPT-5.5 Thinking) while downstream round-trip
+induction model (for example Mayo GPT-5.5 Thinking) while downstream round-trip
 evaluation can use multiple LLMs. The manual V1 schema is intentionally not
 provided to the induction prompt.
 
@@ -36,6 +36,10 @@ except ImportError:  # pragma: no cover
     OpenAI = None  # type: ignore
 
 
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
 def norm(x: Any) -> str:
     if x is None:
         return ""
@@ -59,10 +63,14 @@ def load_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
 
 
 def load_model_config(path: Path, model_key: str) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"model_config_yaml does not exist: {path}")
+    if path.is_dir():
+        raise IsADirectoryError(f"model_config_yaml is a directory, expected YAML file: {path}")
     cfg = yaml.safe_load(path.read_text())
     model_cfg = {**(cfg.get("defaults", {}) or {}), **((cfg.get("models", {}) or {}).get(model_key, {}))}
     if not model_cfg:
-        raise KeyError(f"model_key={model_key!r} not found in {path}")
+        raise KeyError(f"model_key={model_key!r} not found in {path}. Available keys={sorted((cfg.get('models') or {}).keys())}")
     model_cfg["model_key"] = model_key
     return model_cfg
 
@@ -85,14 +93,18 @@ def call_chat(client: Any, cfg: dict[str, Any], messages: list[dict[str, str]]) 
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from apigee_azure_client import call_apigee_chat  # type: ignore
         return call_apigee_chat(client, cfg, messages)
-    kwargs = {"model": cfg["model"], "messages": messages, "max_tokens": int(cfg.get("max_tokens", 8192)), "timeout": float(cfg.get("timeout_seconds", 240))}
+    kwargs = {
+        "model": cfg["model"],
+        "messages": messages,
+        "max_tokens": int(cfg.get("max_tokens", 8192)),
+        "timeout": float(cfg.get("timeout_seconds", 240)),
+    }
     if cfg.get("temperature") is not None:
         kwargs["temperature"] = cfg.get("temperature", 0)
     last = None
     for attempt in range(1, int(cfg.get("max_retries", 3)) + 1):
         try:
-            resp = client.chat.completions.create(**kwargs)
-            return resp.choices[0].message.content or ""
+            return (client.chat.completions.create(**kwargs).choices[0].message.content or "")
         except Exception as exc:
             last = exc
             if attempt < int(cfg.get("max_retries", 3)):
@@ -309,16 +321,25 @@ def validate_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def write_schema(schema: dict[str, Any], out_yaml: Path) -> None:
-    out_yaml.parent.mkdir(parents=True, exist_ok=True)
     out_yaml.write_text(yaml.safe_dump(schema, sort_keys=False, allow_unicode=True))
     out_yaml.with_suffix(".json").write_text(json.dumps(schema, indent=2, ensure_ascii=False))
+
+
+def call_stage(stage_name: str, client: Any, cfg: dict[str, Any], messages: list[dict[str, str]], raw_path: Path) -> dict[str, Any]:
+    approx_chars = sum(len(m.get("content", "")) for m in messages)
+    log(f"Starting LLM stage={stage_name}; prompt_chars={approx_chars}; raw_output={raw_path}")
+    t0 = time.time()
+    raw = call_chat(client, cfg, messages)
+    raw_path.write_text(raw)
+    log(f"Finished LLM stage={stage_name}; elapsed_sec={time.time() - t0:.1f}; response_chars={len(raw)}")
+    return extract_json(raw)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--evidence_cards_jsonl", required=True)
     ap.add_argument("--model_config_yaml", required=True)
-    ap.add_argument("--model_key", required=True, help="Use one fixed strong induction model, e.g. gpt55.")
+    ap.add_argument("--model_key", required=True, help="Use one fixed strong induction model, e.g. mayo_gpt55.")
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--stage", choices=["induce", "critique", "revise", "validate", "all"], default="all")
     ap.add_argument("--max_cards", type=int, default=80)
@@ -330,8 +351,34 @@ def main() -> None:
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    cards = load_jsonl(Path(args.evidence_cards_jsonl), args.limit_cards)
-    cfg = load_model_config(Path(args.model_config_yaml), args.model_key)
+
+    cards_path = Path(args.evidence_cards_jsonl)
+    cfg_path = Path(args.model_config_yaml)
+    log(f"Loading evidence cards: {cards_path}")
+    cards = load_jsonl(cards_path, args.limit_cards)
+    log(f"Loaded cards={len(cards)}; max_cards_sent={args.max_cards}; max_spans_per_card={args.max_spans_per_card}")
+
+    cfg = load_model_config(cfg_path, args.model_key)
+    log(
+        "Loaded model config: "
+        f"model_key={args.model_key}; provider={cfg.get('provider')}; "
+        f"model={cfg.get('model')}; deployment={cfg.get('deployment')}; "
+        f"timeout={cfg.get('timeout_seconds')}; retries={cfg.get('max_retries')}"
+    )
+    if str(cfg.get("provider", "")).lower() == "mayo_apigee_azure_openai":
+        if cfg.get("oauth_client_id_env") and cfg.get("oauth_client_secret_env"):
+            id_set = bool(os.getenv(str(cfg.get("oauth_client_id_env"))))
+            secret_set = bool(os.getenv(str(cfg.get("oauth_client_secret_env"))))
+            log(f"Mayo OAuth mode detected; client_id_env_set={id_set}; client_secret_env_set={secret_set}")
+        else:
+            token_env = cfg.get("api_key_env") or "APIGEE_TOKEN"
+            token_file_env = cfg.get("api_key_file_env") or "APIGEE_TOKEN_FILE"
+            log(
+                "Mayo static-token mode detected; "
+                f"token_env_set={bool(os.getenv(str(token_env)))}; "
+                f"token_file_env_set={bool(os.getenv(str(token_file_env)))}"
+            )
+
     client = make_client(cfg)
 
     initial_path = out / "llm_induced_schema.initial.json"
@@ -339,36 +386,38 @@ def main() -> None:
     final_path = out / "llm_induced_functional_v1_candidate.yaml"
 
     if args.stage in {"induce", "all"}:
-        raw = call_chat(client, cfg, induce_messages(cards, args))
-        (out / "llm_induction_raw_response.txt").write_text(raw)
-        initial = extract_json(raw)
+        initial = call_stage("induce", client, cfg, induce_messages(cards, args), out / "llm_induction_raw_response.txt")
         initial_path.write_text(json.dumps(initial, indent=2, ensure_ascii=False))
+        log(f"Wrote initial schema JSON: {initial_path}")
     else:
+        log(f"Loading existing initial schema JSON: {initial_path}")
         initial = json.loads(initial_path.read_text())
 
     if args.stage in {"critique", "all"}:
-        raw = call_chat(client, cfg, critique_messages(initial, cards, args))
-        (out / "llm_critique_raw_response.txt").write_text(raw)
-        critique = extract_json(raw)
+        critique = call_stage("critique", client, cfg, critique_messages(initial, cards, args), out / "llm_critique_raw_response.txt")
         critique_path.write_text(json.dumps(critique, indent=2, ensure_ascii=False))
+        log(f"Wrote critique JSON: {critique_path}")
     else:
+        log(f"Loading existing critique JSON: {critique_path}")
         critique = json.loads(critique_path.read_text())
 
     if args.stage in {"revise", "all"}:
-        raw = call_chat(client, cfg, revise_messages(initial, critique, args))
-        (out / "llm_revision_raw_response.txt").write_text(raw)
-        final_schema = extract_json(raw)
+        final_schema = call_stage("revise", client, cfg, revise_messages(initial, critique, args), out / "llm_revision_raw_response.txt")
         write_schema(final_schema, final_path)
+        log(f"Wrote final schema YAML/JSON: {final_path}")
     elif final_path.exists():
+        log(f"Loading existing final schema YAML: {final_path}")
         final_schema = yaml.safe_load(final_path.read_text())
     else:
         final_schema = initial
 
     if args.stage in {"validate", "all"}:
         report = validate_schema(final_schema)
-        (out / "llm_induced_schema_validation.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
-        print(json.dumps(report, indent=2, ensure_ascii=False))
-    print(f"Wrote LLM-induced schema artifacts to {out}")
+        report_path = out / "llm_induced_schema_validation.json"
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+        print(json.dumps(report, indent=2, ensure_ascii=False), flush=True)
+        log(f"Wrote validation report: {report_path}")
+    log(f"Wrote LLM-induced schema artifacts to {out}")
 
 
 if __name__ == "__main__":
