@@ -6,13 +6,14 @@ This runbook is the paper-facing workflow from this point forward. The objective
 
 ```text
 1. Split by consent form, not by sentence.
-2. Derive candidate fields only from training forms in each fold.
-3. Use source-element-in-context mentions, not raw source elements, as the unit of analysis.
-4. Split broad source elements into context-specific sense nodes before clustering.
-5. Distinguish near-equivalence from broader/narrower, complementary, and unsafe-to-merge relations.
-6. Use only near-equivalence edges to form candidate fields.
-7. Preserve co-occurrence/provision-bundle edges as complementarity evidence, not merge evidence.
-8. Preserve provenance at every step: form, sentence, source model, LLM, annotation span, source row, and fold.
+2. Prefer the stable `form_key` in the main roundtrips.csv for fold creation.
+3. Derive candidate fields only from training forms in each fold.
+4. Use source-element-in-context mentions, not raw source elements, as the unit of analysis.
+5. Split broad source elements into context-specific sense nodes before clustering.
+6. Distinguish near-equivalence from broader/narrower, complementary, and unsafe-to-merge relations.
+7. Use only near-equivalence edges to form candidate fields.
+8. Preserve co-occurrence/provision-bundle edges as complementarity evidence, not merge evidence.
+9. Preserve provenance at every step: form, sentence, source model, LLM, annotation span, source row, and fold.
 ```
 
 The coarse cluster-ID smoke-test path is no longer the main development path and should not be treated as the paper result.
@@ -39,28 +40,49 @@ python meta_model/scripts/12_build_expert_roundtrip_corpus.py \
   --output_csv meta_model/outputs/expert_roundtrips_clean.csv
 ```
 
-This file is used for schema development only. It is not the same as the held-out evaluation round-trip input.
+This file is used for schema development only. The held-out split should be created from the main `roundtrips.csv` because its `form_key` is the stable consent-form identifier used in the earlier individual-model and Union V0 experiments.
 
 ## 3. Create form-level cross-validation splits
 
-Use consent forms as the split unit to avoid sentence-level leakage.
+Use consent forms as the split unit to avoid sentence-level leakage. Create folds from the main `roundtrips.csv` using its stable `form_key`, while still passing the expert corpus path for workflow consistency.
 
 ```bash
 python meta_model/scripts/23_refined_metamodel_cv_pipeline.py make-folds \
   --expert_roundtrips_csv meta_model/outputs/expert_roundtrips_clean.csv \
+  --split_source_csv /path/to/roundtrips.csv \
   --output_dir meta_model/refined_cv \
   --n_folds 4 \
   --seed 17
 ```
 
-Output:
+Outputs:
 
 ```text
 meta_model/refined_cv/fold_assignments.csv
+meta_model/refined_cv/form_grouping_audit.csv
 meta_model/refined_cv/fold_metadata.json
 ```
 
-Recommended design: 4 folds, each with 15 derivation forms and 5 held-out test forms.
+Before running fold induction, check:
+
+```bash
+cat meta_model/refined_cv/fold_metadata.json
+cut -d, -f1,2,6 meta_model/refined_cv/fold_assignments.csv | column -s, -t | less -S
+```
+
+Expected metadata should show about 20-21 canonical consent forms, not hundreds of sentence-level copy/output files:
+
+```json
+{
+  "split_unit": "canonical_consent_form",
+  "n_forms": 21,
+  "n_folds": 4
+}
+```
+
+Review `form_grouping_audit.csv` if `n_forms` is unexpectedly high or low.
+
+Recommended design: 4 folds, each with roughly 15-16 derivation forms and 5-6 held-out test forms.
 
 ## 4. Run refined induction for each fold
 
@@ -98,6 +120,8 @@ fold_XX/refined_candidate_schema.json
 fold_XX/fold_run_metadata.json
 ```
 
+Check `n_unassigned_mentions` in each `fold_run_metadata.json`. It should be zero or very small. Nonzero values mean some expert rows did not map cleanly to the form-key-derived folds.
+
 ## 5. Interpret the fold outputs
 
 The key distinction is:
@@ -134,7 +158,7 @@ Use this to determine which candidate functions are stable across training folds
 
 ## 7. Held-out forward/backward evaluation
 
-For each fold, evaluate on that fold's held-out forms using the fold-specific schema. The exact held-out input file should be created from the same sentence universe as previous individual-model and Union V0 experiments, filtered to the held-out form IDs in `fold_assignments.csv`.
+For each fold, evaluate on that fold's held-out forms using the fold-specific schema. The held-out input should come from the same sentence universe as previous individual-model and Union V0 experiments, filtered to the held-out canonical form IDs in `fold_assignments.csv`.
 
 Run one hosted vLLM model at a time.
 
@@ -235,15 +259,4 @@ The consensus schema should be built from cross-fold evidence, not from a single
 
 ## 12. Final full-corpus characterization
 
-After the consensus schema is frozen, run a final descriptive evaluation on all 20 forms. Label this as full-corpus characterization, not primary generalization evidence. The primary generalization evidence is the form-level held-out CV.
-
-## Paper claims supported by this workflow
-
-```text
-1. Individual information models cover different parts of informed-consent meaning but are incomplete alone.
-2. Union V0 improves coverage but is bulky and redundant.
-3. A defensible reduced meta-model must separate equivalence from complementarity.
-4. Context-specific source-element senses produce more specific, complementary candidate fields.
-5. Fold-level schema stability and held-out evaluation address overfitting concerns.
-6. Multi-layer evaluation shows preservation of content, cues, relationships, and annotation efficiency.
-```
+After the consensus schema is frozen, run a final descriptive evaluation on all 20-21 forms. Label this as full-corpus characterization, not primary generalization evidence. The primary generalization evidence is the form-level held-out CV.
