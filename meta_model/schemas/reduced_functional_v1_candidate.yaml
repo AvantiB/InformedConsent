@@ -1,0 +1,8 @@
+meta_model_id: reduced_functional_v1_candidate
+status: data_seeded_expert_review_candidate
+derivation_note: >-
+  Candidate reduced informed-consent meta-model seeded by form-level cross-validated
+  analysis of expert-preserved round-trip annotations. Final names, boundaries, and
+  inclusion decisions require PI/domain-expert review before paper-facing use.
+annotation_policy:
+  sentence_decision: provision-level only;
