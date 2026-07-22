@@ -129,7 +129,9 @@ def main() -> None:
     ap.add_argument("--output_dir", required=True)
     args = ap.parse_args()
 
-    df = pd.read_csv(args.scored_csv).fillna("")
+    # The diagnostic CSV has many heterogeneous text/metric columns. low_memory=False
+    # prevents pandas from chunk-inferencing mixed dtypes and emitting DtypeWarning.
+    df = pd.read_csv(args.scored_csv, low_memory=False).fillna("")
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     sc = score_column(df)
