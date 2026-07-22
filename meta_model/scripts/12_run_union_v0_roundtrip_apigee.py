@@ -3,6 +3,8 @@
 
 This wrapper reuses 03_run_union_v0_roundtrip.py and only swaps the chat client.
 Use it for model config entries with provider: mayo_apigee_azure_openai.
+Backward reconstruction inherits the universal strict annotation-only policy from
+03_run_union_v0_roundtrip.py.
 """
 from __future__ import annotations
 
@@ -65,9 +67,10 @@ def main() -> None:
         "n_union_elements": int(len(inv)),
         "inventory_csv": args.inventory_csv,
         "roundtrips_csv": args.roundtrips_csv,
-        "prompt_design": "overlap_aware_raw_annotations_plus_interpretation_units",
+        "prompt_design": "overlap_aware_raw_annotations_plus_audit_interpretation_units_not_backward_eligible",
         "id_validation": "repair_unambiguous_ids_and_flag_remaining_invalid",
-        "backward_input": "sanitized_packet_no_original_sentence_no_raw_forward_response_ordered_by_span_position",
+        "backward_input": mod.STRICT_POLICY,
+        "backward_prompt": "universal_strict_annotation_only",
         "chat_transport": "mayo_apigee_azure_openai",
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(run_meta, indent=2))
@@ -78,11 +81,7 @@ def main() -> None:
     if args.stage in {"backward", "both"}:
         mod.run_backward(client, model_cfg, dictionary_text, output_dir)
 
-    mod.write_roundtrip_csv(
-        output_dir / "union_v0_forward_mappings.jsonl",
-        output_dir / "union_v0_backward_reconstructions.jsonl",
-        output_dir / "union_v0_roundtrip_outputs.csv",
-    )
+    mod.write_roundtrip_csv(output_dir / "union_v0_forward_mappings.jsonl", output_dir / "union_v0_backward_reconstructions.jsonl", output_dir / "union_v0_roundtrip_outputs.csv")
     print(f"Wrote outputs under {output_dir}")
 
 
