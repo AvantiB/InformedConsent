@@ -3,6 +3,7 @@ P0.1,Reset/archive,Freeze old leakage-contaminated outputs,planned,Avanti,2026-0
 P0.2,Reset/archive,Create fresh strict_annotation_only_experiments root,planned,Avanti,2026-07-22,Use fresh root to avoid intermingling old and new outputs.
 P0.3,Documentation,Update README with strict backward policy,done,ChatGPT,2026-07-22,meta_model/README.md updated.
 P0.4,Documentation,Create strict baseline Phase 1 runbook,done,ChatGPT,2026-07-22,meta_model/STRICT_BASELINE_PHASE1_RUNBOOK.md added.
+P0.5,Documentation/code cleanup,Use minimal identical universal backward prompt across runners,done,ChatGPT,2026-07-22,Updated individual Union V0 and functional schema runners; removed dictionary/source-model sections and excluded-field wording from backward prompt.
 P1.1,Baseline strict rerun,Import/copy existing Union V0 forward outputs into fresh root,planned,Avanti,2026-07-22,Copy only union_v0_forward_mappings.jsonl into strict root.
 P1.2,Baseline strict rerun,Import/copy existing individual-model forward outputs into fresh root,planned,Avanti,2026-07-22,Copy only forward_mappings.jsonl for DUO/ICO/ODRL/FHIR_Consent into strict root.
 P1.3,Baseline strict rerun,Rerun Union V0 backward with strict annotation-only input,planned,Avanti,2026-07-22,Use 03_run_union_v0_roundtrip.py or 12_run_union_v0_roundtrip_apigee.py with --stage backward.
