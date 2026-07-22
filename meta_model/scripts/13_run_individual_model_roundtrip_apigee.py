@@ -3,8 +3,6 @@
 
 This wrapper reuses 05_run_individual_model_roundtrip.py and only swaps the chat
 client. Use it for model config entries with provider: mayo_apigee_azure_openai.
-Backward reconstruction inherits the universal strict annotation-only policy from
-05_run_individual_model_roundtrip.py.
 """
 from __future__ import annotations
 
@@ -73,7 +71,7 @@ def main() -> None:
         "backward_prompt_dir_deprecated_not_used": args.backward_prompt_dir,
         "stage": args.stage,
         "backward_input": mod.STRICT_POLICY,
-        "backward_prompt": "universal_strict_annotation_only",
+        "backward_prompt": "minimal_universal_annotation_only",
         "chat_transport": "mayo_apigee_azure_openai",
     }, indent=2))
 
@@ -88,7 +86,7 @@ def main() -> None:
         (out_dir / "prompt_files.json").write_text(json.dumps({
             "forward_prompt_file": str(prompt_path),
             "backward_prompt_file_deprecated_not_used": str(backward_path) if backward_path else None,
-            "uses_universal_strict_backward_prompt": True,
+            "uses_minimal_universal_backward_prompt": True,
             "backward_input_policy": mod.STRICT_POLICY,
         }, indent=2))
         mod.run_info_model(rows, client, model_cfg, info_model, prompt_text, backward_text, out_dir, args.stage)
