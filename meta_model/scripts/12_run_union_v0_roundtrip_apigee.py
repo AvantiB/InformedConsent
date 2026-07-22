@@ -3,8 +3,6 @@
 
 This wrapper reuses 03_run_union_v0_roundtrip.py and only swaps the chat client.
 Use it for model config entries with provider: mayo_apigee_azure_openai.
-Backward reconstruction inherits the universal strict annotation-only policy from
-03_run_union_v0_roundtrip.py.
 """
 from __future__ import annotations
 
@@ -67,10 +65,10 @@ def main() -> None:
         "n_union_elements": int(len(inv)),
         "inventory_csv": args.inventory_csv,
         "roundtrips_csv": args.roundtrips_csv,
-        "prompt_design": "overlap_aware_raw_annotations_plus_audit_interpretation_units_not_backward_eligible",
+        "prompt_design": "overlap_aware_forward_with_audit_fields",
         "id_validation": "repair_unambiguous_ids_and_flag_remaining_invalid",
         "backward_input": mod.STRICT_POLICY,
-        "backward_prompt": "universal_strict_annotation_only",
+        "backward_prompt": "minimal_universal_annotation_only",
         "chat_transport": "mayo_apigee_azure_openai",
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(run_meta, indent=2))
