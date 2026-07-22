@@ -1,18 +1,11 @@
 #!/usr/bin/env python
 """Run individual source-model prompt round-trip experiments.
 
-Replication condition: new LLMs + original individual source-model prompts.
-
 Forward uses the original source-model forward prompt text and can be reused from
-previous runs. Backward reconstruction is now strict and universal across all
-experiments: it receives only valid span-level annotations plus sentence-level
-annotations only when at least one valid span annotation exists. It does not
-receive unmatched/residual language, interpretation units, rationales, raw
-forward text, previous reconstructions, or the original sentence.
-
-Rows with no backward-eligible annotations are not sent to the LLM; their
-reconstruction is intentionally blank so residual-only mappings cannot receive
-inflated meaning-preservation scores.
+previous runs. Backward evaluation is strict and universal: it receives only the
+annotation-only mapping built from parsed span annotations and eligible
+sentence-level annotations. Rows with no backward-eligible annotations are not
+sent to the LLM; their reconstruction is intentionally blank.
 """
 from __future__ import annotations
 
@@ -48,9 +41,30 @@ SPAN_KEYS = ["span_text", "evidence_span_text", "evidence_text", "text_span", "p
 LABEL_KEYS = ["field_name", "field_id", "label", "element", "element_id", "source_element_id", "union_element_id", "node", "term", "class", "category", "path", "role", "type", "id"]
 DECISION_KEYS = ["decision", "polarity", "consent_force", "permission", "rule_type", "value"]
 DECISION_VALUES = {"permit", "deny", "denied", "prohibit", "prohibition", "permission", "obligation", "mixed", "unclear", "allow", "allowed"}
-MASK = "[ORIGINAL_SENTENCE_REMOVED]"
-STRICT_POLICY = "strict_annotation_only_no_unmatched_language_no_interpretation_units_no_rationales"
-NO_ANNOTATION_NOTE = "No valid backward-eligible annotations were available; reconstruction intentionally left blank."
+STRICT_POLICY = "strict_annotation_only"
+NO_ANNOTATION_NOTE = "Annotation evidence was empty or insufficient."
+
+UNIVERSAL_BACKWARD_SYSTEM = (
+    "You reconstruct informed-consent sentence meaning from an annotation-only mapping. "
+    "Return valid JSON only."
+)
+UNIVERSAL_BACKWARD_USER_TEMPLATE = """
+Task: reconstruct one concise natural-language consent sentence using only the annotation-only mapping below.
+
+Instructions:
+- Use only information explicitly present in the annotation-only mapping.
+- Preserve the order indicated by sentence_order_index when available.
+- If the annotation evidence is empty or insufficient, return an empty reconstructed_sentence and explain that annotation evidence was insufficient.
+
+Annotation-only mapping:
+{mapping_text}
+
+Return JSON with exactly this structure:
+{{
+  "reconstructed_sentence": "...",
+  "reconstruction_notes": "brief note or empty string"
+}}
+""".strip()
 
 
 def norm_text(x: Any) -> str:
@@ -141,8 +155,8 @@ def find_prompt_file(prompt_dir: Path, info_model: str) -> Path:
 
 
 def find_backward_prompt_file(backward_dir: Path | None, info_model: str) -> Path | None:
-    # Retained for backwards-compatible CLI metadata only. The current backward
-    # evaluator always uses the universal strict prompt below.
+    # Retained for backwards-compatible CLI metadata only. The evaluator always
+    # uses the universal prompt in this script.
     if backward_dir is None or not backward_dir.exists():
         return None
     patterns = PROMPT_PATTERNS[info_model]
@@ -313,7 +327,7 @@ def is_probable_label_or_decision(value: str) -> bool:
 def choose_row_span(cells: list[str], source_text: str) -> tuple[str, int | None, int | None]:
     candidates = []
     for cell in cells:
-        if not cell or cell == MASK or is_probable_label_or_decision(cell):
+        if not cell or is_probable_label_or_decision(cell):
             continue
         start, end = find_span_bounds(source_text, cell)
         if start is None or end is None:
@@ -346,8 +360,8 @@ def csv_annotations(text: str, source_text: str) -> list[dict[str, str]]:
         span, _, _ = choose_row_span(row, source_text)
         if not span:
             continue
-        labels = [c for c in row if c and c != span and c != MASK and not is_full_sentence_like(c, source_text)]
-        labels = [c for c in labels if not c.lower() in {"span", "text", "sentence", "full_text"}]
+        labels = [c for c in row if c and c != span and not is_full_sentence_like(c, source_text)]
+        labels = [c for c in labels if c.lower() not in {"span", "text", "sentence", "full_text"}]
         label = next((c for c in labels if c.lower() not in DECISION_VALUES), "")
         decision = next((c for c in labels if c.lower() in DECISION_VALUES), "")
         if label:
@@ -363,7 +377,7 @@ def parse_span_annotations(raw_forward: str, source_text: str) -> tuple[list[dic
         annotations = collect_json_annotations(parsed)
         parse_mode = "json_like"
     except Exception:
-        parsed = None
+        pass
     if not annotations:
         annotations = compact_annotations(raw_forward)
         parse_mode = "compact_bracket" if annotations else parse_mode
@@ -373,7 +387,7 @@ def parse_span_annotations(raw_forward: str, source_text: str) -> tuple[list[dic
     seen = set()
     kept = []
     dropped_full_sentence = 0
-    for i, ann in enumerate(annotations, start=1):
+    for ann in annotations:
         span = norm_text(ann.get("span_text"))
         label = norm_text(ann.get("label"))
         if not span or not label:
@@ -404,20 +418,19 @@ def extract_sentence_level_annotations(raw_forward: str, has_valid_span_annotati
         for key in ["sentence_decision", "decision", "rule_type", "permission", "prohibition"]:
             val = norm_text(parsed.get(key))
             if val:
-                out.append({"field": key, "value": val, "support_policy": "included_only_because_valid_span_annotations_exist"})
+                out.append({"field": key, "value": val, "support": "valid_span_annotations_present"})
         elems = parsed.get("sentence_level_elements") or []
         if isinstance(elems, list):
             for item in elems:
                 if isinstance(item, dict):
                     d = {k: norm_text(v) for k, v in item.items() if norm_text(v)}
                     if d:
-                        d["support_policy"] = "included_only_because_valid_span_annotations_exist"
+                        d["support"] = "valid_span_annotations_present"
                         out.append(d)
     return out
 
 
-def build_sanitized_forward_material(raw_forward: str, source_text: str) -> dict[str, Any]:
-    """Build strict annotation-only backward input from an existing forward output."""
+def build_sanitized_forward_material(raw_forward: str, source_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
     annotations, audit = parse_span_annotations(raw_forward, source_text)
     ordered = []
     for ann in annotations:
@@ -435,41 +448,19 @@ def build_sanitized_forward_material(raw_forward: str, source_text: str) -> dict
     ordered.sort(key=lambda x: (10**9 if x.get("span_start") is None else int(x.get("span_start")), str(x.get("annotation_id", ""))))
     for i, item in enumerate(ordered, start=1):
         item["sentence_order_index"] = i
-    return {
+    packet = {
         "backward_input_policy": STRICT_POLICY,
         "ordered_reconstruction_items": ordered,
         "sentence_level_annotations": extract_sentence_level_annotations(raw_forward, bool(ordered)),
-        "annotation_audit": {**audit, "excluded_from_backward": ["unmatched_language", "interpretation_units", "combined_meaning", "rationale", "raw_forward_response", "original_sentence"]},
     }
+    audit = {**audit, "n_sentence_level_annotations_backward_eligible": len(packet["sentence_level_annotations"])}
+    return packet, audit
 
 
-def build_backward_messages(info_model: str, sanitized_material: dict[str, Any], backward_prompt_text: str | None = None) -> list[dict[str, str]]:
-    _ = backward_prompt_text  # intentionally ignored: universal backward prompt for all experiments
-    system = "You reconstruct informed-consent sentence meaning from annotation evidence only. You do not see the original sentence. Return valid JSON only."
+def build_backward_messages(sanitized_material: dict[str, Any]) -> list[dict[str, str]]:
     material_text = json.dumps(sanitized_material, ensure_ascii=False, indent=2)
-    user = f"""
-Task: reconstruct one concise natural-language consent sentence using ONLY the annotation-only mapping below.
-
-Universal strict backward policy:
-- The original sentence is intentionally not provided.
-- Use only ordered_reconstruction_items and sentence_level_annotations from the mapping.
-- Do not use, infer, or request unmatched/residual language, interpretation units, rationales, combined meanings, raw forward responses, or the original sentence.
-- If ordered_reconstruction_items are empty or insufficient, return an empty reconstructed_sentence and explain that the annotations are insufficient.
-- Preserve only the meaning supported by the annotation spans and labels.
-- Do not add actors, actions, resources, purposes, conditions, restrictions, or temporal details that are not present in the annotation-only mapping.
-
-Information model / label source: {info_model}
-
-Annotation-only mapping for reconstruction:
-{material_text}
-
-Return JSON with exactly this structure:
-{{
-  "reconstructed_sentence": "...",
-  "reconstruction_notes": "brief note or empty string"
-}}
-""".strip()
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    user = UNIVERSAL_BACKWARD_USER_TEMPLATE.format(mapping_text=material_text)
+    return [{"role": "system", "content": UNIVERSAL_BACKWARD_SYSTEM}, {"role": "user", "content": user}]
 
 
 def read_done(path: Path) -> set[str]:
@@ -525,6 +516,7 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
     for source_id, f in fwd.items():
         b = bwd.get(source_id, {})
         packet = b.get("sanitized_forward_material", {})
+        audit = b.get("backward_annotation_audit", {})
         items = packet.get("ordered_reconstruction_items") or []
         parsed_back = b.get("parsed_backward") or parse_backward_response(b.get("raw_response", ""))
         rows.append({
@@ -537,11 +529,12 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
             "backward_input_sanitized": b.get("backward_input_sanitized", False),
             "backward_input_policy": packet.get("backward_input_policy", STRICT_POLICY),
             "sanitized_forward_material_json": json.dumps(packet, ensure_ascii=False),
+            "backward_annotation_audit_json": json.dumps(audit, ensure_ascii=False),
             "annotation_count": len(items),
             "unique_element_count": len({norm_text(x.get("label")) for x in items if isinstance(x, dict) and norm_text(x.get("label"))}),
             "n_annotations_backward_eligible": len(items),
-            "n_full_sentence_spans_dropped": (packet.get("annotation_audit") or {}).get("n_full_sentence_spans_dropped", ""),
-            "annotation_parse_mode": (packet.get("annotation_audit") or {}).get("annotation_parse_mode", ""),
+            "n_full_sentence_spans_dropped": audit.get("n_full_sentence_spans_dropped", ""),
+            "annotation_parse_mode": audit.get("annotation_parse_mode", ""),
             "forward_parse_ok": bool(items) or bool(f.get("raw_response", "")),
             "backward_parse_ok": b.get("parse_ok", False),
             "reconstructed_sentence": parsed_back.get("reconstructed_sentence", ""),
@@ -551,6 +544,7 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
 
 
 def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], info_model: str, prompt_text: str, backward_prompt_text: str | None, out_dir: Path, stage: str) -> None:
+    _ = backward_prompt_text
     out_dir.mkdir(parents=True, exist_ok=True)
     forward_path = out_dir / "forward_mappings.jsonl"
     backward_path = out_dir / "backward_reconstructions.jsonl"
@@ -580,14 +574,14 @@ def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any]
                 continue
             try:
                 source_text = fwd.get("source_text", "")
-                sanitized_material = build_sanitized_forward_material(fwd.get("raw_response", ""), source_text)
+                sanitized_material, audit = build_sanitized_forward_material(fwd.get("raw_response", ""), source_text)
                 if not sanitized_material.get("ordered_reconstruction_items"):
                     parsed_back = {"reconstructed_sentence": "", "reconstruction_notes": NO_ANNOTATION_NOTE}
                     raw = json.dumps(parsed_back, ensure_ascii=False)
                 else:
-                    raw = call_chat(client, model_cfg, build_backward_messages(info_model, sanitized_material, backward_prompt_text))
+                    raw = call_chat(client, model_cfg, build_backward_messages(sanitized_material))
                     parsed_back = parse_backward_response(raw)
-                append_jsonl(backward_path, {"source_id": source_id, "source_text": source_text, "model_key": model_cfg["model_key"], "model": model_cfg["model"], "info_model": info_model, "stage": "backward", "backward_input_sanitized": True, "backward_input_policy": STRICT_POLICY, "sanitized_forward_material": sanitized_material, "parsed_backward": parsed_back, "parse_ok": True, "raw_response": raw})
+                append_jsonl(backward_path, {"source_id": source_id, "source_text": source_text, "model_key": model_cfg["model_key"], "model": model_cfg["model"], "info_model": info_model, "stage": "backward", "backward_input_sanitized": True, "backward_input_policy": STRICT_POLICY, "sanitized_forward_material": sanitized_material, "backward_annotation_audit": audit, "parsed_backward": parsed_back, "parse_ok": True, "raw_response": raw})
                 done.add(source_id)
                 print(f"[{info_model} backward] {i + 1}/{len(fwd_by_id)} ok {source_id} eligible_annotations={len(sanitized_material.get('ordered_reconstruction_items') or [])}")
             except Exception as exc:
@@ -634,7 +628,7 @@ def main() -> None:
         "backward_prompt_dir": args.backward_prompt_dir,
         "stage": args.stage,
         "backward_input": STRICT_POLICY,
-        "backward_prompt": "universal_strict_annotation_only",
+        "backward_prompt": "minimal_universal_annotation_only",
     }, indent=2))
 
     for info_model in info_models:
