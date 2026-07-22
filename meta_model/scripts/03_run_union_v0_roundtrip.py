@@ -1,17 +1,11 @@
 #!/usr/bin/env python
 """Run Union V0 full-dictionary forward/backward round-trip experiments.
 
-Forward mapping remains overlap-aware and may include rich audit material such as
-interpretation_units and unmatched_language. For evaluation, backward
-reconstruction is now strict and universal: the backward LLM receives only valid
-span-level annotations plus sentence-level annotations only when at least one
-valid span annotation exists. It never receives unmatched_language,
-interpretation_units, combined_meaning, rationales, raw forward text, or the
-original sentence.
-
-Rows with no backward-eligible annotations are not sent to the LLM; their
-reconstruction is intentionally blank so that residual-only mappings do not
-receive inflated meaning-preservation scores.
+Forward mapping remains overlap-aware and may include rich audit material for
+human review. Backward evaluation is strict and universal: the backward LLM
+receives only the annotation-only mapping built from valid span annotations and
+eligible sentence-level annotations. Rows with no backward-eligible annotations
+are not sent to the LLM; their reconstruction is intentionally blank.
 """
 from __future__ import annotations
 
@@ -41,9 +35,39 @@ except ImportError as exc:
 
 TEXT_COL_CANDIDATES = ["canonical_full_text", "full_text_original", "original_sentence", "full_text", "sentence", "text"]
 ID_COL_CANDIDATES = ["sentence_id", "source_sentence_id", "roundtrip_id", "id"]
-MASK = "[ORIGINAL_SENTENCE_REMOVED]"
-STRICT_POLICY = "strict_annotation_only_no_unmatched_language_no_interpretation_units_no_rationales"
-NO_ANNOTATION_NOTE = "No valid backward-eligible annotations were available; reconstruction intentionally left blank."
+STRICT_POLICY = "strict_annotation_only"
+NO_ANNOTATION_NOTE = "Annotation evidence was empty or insufficient."
+
+UNIVERSAL_BACKWARD_SYSTEM = (
+    "You reconstruct informed-consent sentence meaning from an annotation-only mapping. "
+    "Return valid JSON only."
+)
+UNIVERSAL_BACKWARD_USER_TEMPLATE = """
+Task: reconstruct one concise natural-language consent sentence using only the annotation-only mapping below.
+
+Instructions:
+- Use only information explicitly present in the annotation-only mapping.
+- Preserve the order indicated by sentence_order_index when available.
+- If the annotation evidence is empty or insufficient, return an empty reconstructed_sentence and explain that annotation evidence was insufficient.
+
+Annotation-only mapping:
+{mapping_text}
+
+Return JSON with exactly this structure:
+{{
+  "reconstructed_sentence": "...",
+  "reconstruction_notes": "brief note or empty string"
+}}
+""".strip()
+
+
+def norm_text(x: Any) -> str:
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return " ".join(str(x).split())
 
 
 def pick_col(df: pd.DataFrame, candidates: list[str], required: bool = True) -> str | None:
@@ -54,15 +78,6 @@ def pick_col(df: pd.DataFrame, candidates: list[str], required: bool = True) -> 
     if required:
         raise ValueError(f"Could not find any of columns {candidates}. Available: {list(df.columns)}")
     return None
-
-
-def norm_text(x: Any) -> str:
-    try:
-        if pd.isna(x):
-            return ""
-    except Exception:
-        pass
-    return " ".join(str(x).split())
 
 
 def stable_id(text: str) -> str:
@@ -231,7 +246,7 @@ def ordered_annotations_for_backward(parsed_forward: dict[str, Any], source_text
             dropped_full_sentence += 1
             continue
         start, end = find_span_bounds(source_text, span)
-        item = {
+        ordered.append({
             "annotation_id": norm_text(ann.get("annotation_id")),
             "span_text": span,
             "label": uid,
@@ -239,19 +254,11 @@ def ordered_annotations_for_backward(parsed_forward: dict[str, Any], source_text
             "overlap_group_id": norm_text(ann.get("overlap_group_id")),
             "span_start": start,
             "span_end": end,
-        }
-        ordered.append(item)
-
-    def sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
-        start = item.get("span_start") if item.get("span_start") is not None else 10**9
-        end = item.get("span_end") if item.get("span_end") is not None else start
-        return int(start), -int(end - start), str(item.get("annotation_id", ""))
-
-    ordered = sorted(ordered, key=sort_key)
+        })
+    ordered = sorted(ordered, key=lambda item: (10**9 if item.get("span_start") is None else int(item.get("span_start")), -int((item.get("span_end") or item.get("span_start") or 0) - (item.get("span_start") or 0)), str(item.get("annotation_id", ""))))
     for i, ann in enumerate(ordered, start=1):
         ann["sentence_order_index"] = i
-    audit = {"n_full_sentence_spans_dropped": dropped_full_sentence, "n_annotations_backward_eligible_strict": len(ordered)}
-    return ordered, audit
+    return ordered, {"n_full_sentence_spans_dropped": dropped_full_sentence, "n_annotations_backward_eligible_strict": len(ordered)}
 
 
 def eligible_sentence_level_annotations(parsed_forward: dict[str, Any], has_valid_span_annotations: bool) -> list[dict[str, Any]]:
@@ -259,32 +266,31 @@ def eligible_sentence_level_annotations(parsed_forward: dict[str, Any], has_vali
         return []
     out = []
     if norm_text(parsed_forward.get("sentence_decision")):
-        out.append({"field": "sentence_decision", "value": norm_text(parsed_forward.get("sentence_decision")), "support_policy": "included_only_because_valid_span_annotations_exist"})
+        out.append({"field": "sentence_decision", "value": norm_text(parsed_forward.get("sentence_decision")), "support": "valid_span_annotations_present"})
     elems = parsed_forward.get("sentence_level_elements") or []
     if isinstance(elems, list):
         for item in elems:
             if isinstance(item, dict):
                 val = {k: norm_text(v) for k, v in item.items() if norm_text(v)}
                 if val:
-                    val["support_policy"] = "included_only_because_valid_span_annotations_exist"
+                    val["support"] = "valid_span_annotations_present"
                     out.append(val)
     return out
 
 
-def build_backward_packet(parsed_forward: dict[str, Any], source_text: str) -> dict[str, Any]:
-    """Build strict, universal, annotation-only backward input."""
+def build_backward_packet(parsed_forward: dict[str, Any], source_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
     ordered, audit = ordered_annotations_for_backward(parsed_forward, source_text)
     packet = {
         "backward_input_policy": STRICT_POLICY,
         "ordered_reconstruction_items": ordered,
         "sentence_level_annotations": eligible_sentence_level_annotations(parsed_forward, bool(ordered)),
-        "annotation_audit": {
-            **audit,
-            "n_annotations_forward_valid": len(parsed_forward.get("annotations") or []) if isinstance(parsed_forward.get("annotations"), list) else 0,
-            "excluded_from_backward": ["unmatched_language", "interpretation_units", "combined_meaning", "rationale", "raw_forward_response", "original_sentence", "invalid_annotations"],
-        },
     }
-    return packet
+    audit = {
+        **audit,
+        "n_annotations_forward_valid": len(parsed_forward.get("annotations") or []) if isinstance(parsed_forward.get("annotations"), list) else 0,
+        "n_sentence_level_annotations_backward_eligible": len(packet["sentence_level_annotations"]),
+    }
+    return packet, audit
 
 
 def load_model_config(path: Path, model_key: str) -> dict[str, Any]:
@@ -370,7 +376,7 @@ Annotation rules:
 
 Audit rules:
 - You may include interpretation_units and unmatched_language for human audit.
-- These audit fields will NOT be available to the backward reconstruction evaluator.
+- These audit fields will not be included in the annotation-only backward mapping.
 
 Data dictionary:
 {dictionary_text}
@@ -395,7 +401,7 @@ Return JSON with exactly this structure:
       "evidence_span_text": "span or phrase represented by this unit",
       "annotation_ids": ["a1", "a2"],
       "relationship": "single|same_span_multiple_labels|nested_broad_narrow|complementary_roles|conflicting_or_uncertain",
-      "combined_meaning": "audit only; not backward eligible",
+      "combined_meaning": "audit only",
       "backward_mapping_decision": "audit only",
       "rationale": "brief explanation of how the annotations should be considered together"
     }}
@@ -409,33 +415,10 @@ Sentence:
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def build_backward_messages(backward_packet: dict[str, Any], dictionary_text: str) -> list[dict[str, str]]:
-    system = "You reconstruct informed-consent sentence meaning from annotation evidence only. You do not see the original sentence. Return valid JSON only."
+def build_backward_messages(backward_packet: dict[str, Any]) -> list[dict[str, str]]:
     mapping_text = json.dumps(backward_packet, ensure_ascii=False, indent=2)
-    user = f"""
-Task: reconstruct one concise natural-language consent sentence using ONLY the annotation-only mapping below.
-
-Universal strict backward policy:
-- The original sentence is intentionally not provided.
-- Use only ordered_reconstruction_items and sentence_level_annotations from the mapping.
-- Do not use, infer, or request unmatched/residual language, interpretation units, rationales, combined meanings, raw forward responses, or the original sentence.
-- If ordered_reconstruction_items are empty or insufficient, return an empty reconstructed_sentence and explain that the annotations are insufficient.
-- Preserve only the meaning supported by the annotation spans and labels.
-- Do not add actors, actions, resources, purposes, conditions, restrictions, or temporal details that are not present in the annotation-only mapping.
-
-Label dictionary for interpreting annotation labels:
-{dictionary_text}
-
-Annotation-only mapping for reconstruction:
-{mapping_text}
-
-Return JSON with exactly this structure:
-{{
-  "reconstructed_sentence": "...",
-  "reconstruction_notes": "brief note or empty string"
-}}
-""".strip()
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    user = UNIVERSAL_BACKWARD_USER_TEMPLATE.format(mapping_text=mapping_text)
+    return [{"role": "system", "content": UNIVERSAL_BACKWARD_SYSTEM}, {"role": "user", "content": user}]
 
 
 def read_done_keys(path: Path, key_field: str = "source_id") -> set[str]:
@@ -486,6 +469,7 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
         units = parsed.get("interpretation_units") or []
         bwd = backward.get(source_id, {})
         packet = bwd.get("backward_packet", {})
+        audit = bwd.get("backward_annotation_audit", {})
         strict_items = packet.get("ordered_reconstruction_items") or []
         rows.append({
             "source_id": source_id,
@@ -497,7 +481,7 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
             "n_annotations_repaired": validation.get("n_annotations_repaired", ""),
             "n_annotations_invalid": validation.get("n_annotations_invalid", ""),
             "n_annotations_backward_eligible": len(strict_items),
-            "n_full_sentence_spans_dropped": (packet.get("annotation_audit") or {}).get("n_full_sentence_spans_dropped", ""),
+            "n_full_sentence_spans_dropped": audit.get("n_full_sentence_spans_dropped", ""),
             "n_interpretation_units": len(units) if isinstance(units, list) else "",
             "forward_parse_ok": fwd.get("parse_ok", False),
             "backward_parse_ok": bwd.get("parse_ok", False),
@@ -510,6 +494,7 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
             "invalid_annotations_json": json.dumps(invalid_annotations, ensure_ascii=False),
             "interpretation_units_json": json.dumps(units, ensure_ascii=False),
             "backward_packet_json": json.dumps(packet, ensure_ascii=False),
+            "backward_annotation_audit_json": json.dumps(audit, ensure_ascii=False),
             "forward_raw": fwd.get("raw_response", ""),
             "backward_raw": bwd.get("raw_response", ""),
         })
@@ -537,6 +522,7 @@ def run_forward(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], d
 
 
 def run_backward(client: OpenAI, model_cfg: dict[str, Any], dictionary_text: str, out_dir: Path) -> None:
+    _ = dictionary_text
     forward_path = out_dir / "union_v0_forward_mappings.jsonl"
     backward_path = out_dir / "union_v0_backward_reconstructions.jsonl"
     failures_path = out_dir / "failed_requests.jsonl"
@@ -548,14 +534,14 @@ def run_backward(client: OpenAI, model_cfg: dict[str, Any], dictionary_text: str
         try:
             parsed_forward = fwd.get("parsed_forward") or {}
             source_text = fwd.get("source_text", "")
-            packet = build_backward_packet(parsed_forward, source_text)
+            packet, audit = build_backward_packet(parsed_forward, source_text)
             if not packet.get("ordered_reconstruction_items"):
                 parsed = {"reconstructed_sentence": "", "reconstruction_notes": NO_ANNOTATION_NOTE}
                 raw = json.dumps(parsed, ensure_ascii=False)
             else:
-                raw = call_chat(client, model_cfg, build_backward_messages(packet, dictionary_text))
+                raw = call_chat(client, model_cfg, build_backward_messages(packet))
                 parsed = extract_json(raw)
-            append_jsonl(backward_path, {"source_id": source_id, "source_text": source_text, "model_key": model_cfg["model_key"], "model": model_cfg["model"], "stage": "backward", "parse_ok": True, "backward_input_sanitized": True, "backward_input_policy": STRICT_POLICY, "backward_packet": packet, "parsed_backward": parsed, "raw_response": raw})
+            append_jsonl(backward_path, {"source_id": source_id, "source_text": source_text, "model_key": model_cfg["model_key"], "model": model_cfg["model"], "stage": "backward", "parse_ok": True, "backward_input_sanitized": True, "backward_input_policy": STRICT_POLICY, "backward_packet": packet, "backward_annotation_audit": audit, "parsed_backward": parsed, "raw_response": raw})
             done.add(source_id)
             print(f"[backward] {i + 1}/{len(forward)} ok {source_id} eligible_annotations={len(packet.get('ordered_reconstruction_items') or [])}")
         except Exception as exc:
@@ -592,9 +578,10 @@ def main() -> None:
         "n_union_elements": int(len(inv)),
         "inventory_csv": args.inventory_csv,
         "roundtrips_csv": args.roundtrips_csv,
-        "prompt_design": "overlap_aware_raw_annotations_plus_audit_interpretation_units_not_backward_eligible",
+        "prompt_design": "overlap_aware_forward_with_audit_fields",
         "id_validation": "repair_unambiguous_ids_and_flag_remaining_invalid",
         "backward_input": STRICT_POLICY,
+        "backward_prompt": "minimal_universal_annotation_only",
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(run_meta, indent=2))
 
