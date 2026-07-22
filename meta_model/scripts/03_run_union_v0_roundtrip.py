@@ -1,16 +1,17 @@
 #!/usr/bin/env python
 """Run Union V0 full-dictionary forward/backward round-trip experiments.
 
-Forward mapping intentionally has two layers:
-1. raw annotations, including same-span, overlapping, and nested labels; and
-2. interpretation_units, where the LLM decides how related annotations should be
-   considered together for backward reconstruction.
+Forward mapping remains overlap-aware and may include rich audit material such as
+interpretation_units and unmatched_language. For evaluation, backward
+reconstruction is now strict and universal: the backward LLM receives only valid
+span-level annotations plus sentence-level annotations only when at least one
+valid span annotation exists. It never receives unmatched_language,
+interpretation_units, combined_meaning, rationales, raw forward text, or the
+original sentence.
 
-Backward mapping never receives the original sentence or the raw forward response.
-Instead, it receives a sanitized reconstruction packet with valid annotations ordered
-by their position in the original sentence. The annotation spans themselves are kept,
-because they are the evidence needed for reconstruction, but the full original
-sentence is removed/masked if it appears in any generated field.
+Rows with no backward-eligible annotations are not sent to the LLM; their
+reconstruction is intentionally blank so that residual-only mappings do not
+receive inflated meaning-preservation scores.
 """
 from __future__ import annotations
 
@@ -38,16 +39,11 @@ try:
 except ImportError as exc:
     raise SystemExit("Missing dependency: openai. Install with: pip install openai") from exc
 
-TEXT_COL_CANDIDATES = [
-    "canonical_full_text",
-    "full_text_original",
-    "original_sentence",
-    "full_text",
-    "sentence",
-    "text",
-]
+TEXT_COL_CANDIDATES = ["canonical_full_text", "full_text_original", "original_sentence", "full_text", "sentence", "text"]
 ID_COL_CANDIDATES = ["sentence_id", "source_sentence_id", "roundtrip_id", "id"]
 MASK = "[ORIGINAL_SENTENCE_REMOVED]"
+STRICT_POLICY = "strict_annotation_only_no_unmatched_language_no_interpretation_units_no_rationales"
+NO_ANNOTATION_NOTE = "No valid backward-eligible annotations were available; reconstruction intentionally left blank."
 
 
 def pick_col(df: pd.DataFrame, candidates: list[str], required: bool = True) -> str | None:
@@ -61,8 +57,11 @@ def pick_col(df: pd.DataFrame, candidates: list[str], required: bool = True) -> 
 
 
 def norm_text(x: Any) -> str:
-    if pd.isna(x):
-        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
     return " ".join(str(x).split())
 
 
@@ -89,13 +88,7 @@ def load_rows(roundtrips_csv: Path, limit: int | None, no_dedupe_sentences: bool
 
 def load_inventory(inventory_csv: Path) -> pd.DataFrame:
     inv = pd.read_csv(inventory_csv).fillna("")
-    required = [
-        "union_element_id",
-        "source_model",
-        "source_element_id",
-        "source_element_label",
-        "source_element_definition",
-    ]
+    required = ["union_element_id", "source_model", "source_element_id", "source_element_label", "source_element_definition"]
     missing = [c for c in required if c not in inv.columns]
     if missing:
         raise ValueError(f"Inventory missing required columns: {missing}")
@@ -142,18 +135,12 @@ def repair_union_id(uid: Any, maps: dict[str, Any]) -> tuple[str, str]:
         return uid, "invalid"
     if uid in maps["valid_ids"]:
         return uid, "valid"
-
     matches = maps["by_source_id"].get(uid, [])
     if len(matches) == 1:
         return matches[0], "repaired"
-
     if "::" not in uid and ":" in uid:
         source_model, rest = uid.split(":", 1)
-        candidates = [
-            (source_model, rest),
-            (source_model, f"{source_model}:{rest}"),
-            (source_model.replace("FHIR", "FHIR_Consent"), rest),
-        ]
+        candidates = [(source_model, rest), (source_model, f"{source_model}:{rest}"), (source_model.replace("FHIR", "FHIR_Consent"), rest)]
         for key in candidates:
             if key in maps["by_pair"]:
                 return maps["by_pair"][key], "repaired"
@@ -165,10 +152,9 @@ def validate_forward_obj(forward_obj: dict[str, Any], maps: dict[str, Any]) -> t
     annotations = obj.get("annotations") or []
     if not isinstance(annotations, list):
         annotations = []
-    valid_annotations = []
-    invalid_annotations = []
+    valid_annotations: list[dict[str, Any]] = []
+    invalid_annotations: list[dict[str, Any]] = []
     n_valid = n_repaired = n_invalid = 0
-
     for ann in annotations:
         if not isinstance(ann, dict):
             n_invalid += 1
@@ -191,66 +177,28 @@ def validate_forward_obj(forward_obj: dict[str, Any], maps: dict[str, Any]) -> t
             bad = copy.deepcopy(ann)
             bad["invalid_union_element_id"] = original_uid
             invalid_annotations.append(bad)
-
     obj["annotations"] = valid_annotations
     obj["invalid_annotations"] = invalid_annotations
-
-    units = obj.get("interpretation_units") or []
-    if not isinstance(units, list):
-        units = []
-    valid_ids = {str(a.get("annotation_id")) for a in valid_annotations if a.get("annotation_id") is not None}
-    invalid_ids = {str(a.get("annotation_id")) for a in invalid_annotations if isinstance(a, dict) and a.get("annotation_id") is not None}
-    for unit in units:
-        if isinstance(unit, dict):
-            ids = [str(x) for x in (unit.get("annotation_ids") or [])]
-            unit["valid_annotation_ids"] = [x for x in ids if x in valid_ids]
-            unit["invalid_annotation_ids"] = [x for x in ids if x in invalid_ids]
-    obj["interpretation_units"] = units
-
     validation = {
         "n_annotations_raw": len(annotations),
         "n_annotations_valid": n_valid,
         "n_annotations_repaired": n_repaired,
         "n_annotations_invalid": n_invalid,
         "n_annotations_backward_eligible": len(valid_annotations),
-        "n_interpretation_units": len(units),
+        "n_interpretation_units": len(obj.get("interpretation_units") or []) if isinstance(obj.get("interpretation_units"), list) else 0,
         "has_invalid_ids": n_invalid > 0,
     }
     obj["validation_summary"] = validation
     return obj, validation
 
 
-def mask_original_sentence_in_text(text: Any, source_text: str) -> Any:
-    if not isinstance(text, str) or not source_text:
-        return text
-    out = text
-    variants = {source_text, norm_text(source_text)}
-    for variant in variants:
-        if not variant:
-            continue
-        out = re.sub(re.escape(variant), MASK, out, flags=re.IGNORECASE)
-    return out
-
-
-def mask_original_sentence_in_obj(obj: Any, source_text: str) -> Any:
-    if isinstance(obj, str):
-        return mask_original_sentence_in_text(obj, source_text)
-    if isinstance(obj, list):
-        return [mask_original_sentence_in_obj(x, source_text) for x in obj]
-    if isinstance(obj, dict):
-        return {k: mask_original_sentence_in_obj(v, source_text) for k, v in obj.items()}
-    return obj
-
-
 def find_span_bounds(sentence: str, span: Any) -> tuple[int | None, int | None]:
     if not isinstance(span, str) or not span.strip():
         return None, None
-    s_low = sentence.lower()
-    span_norm = " ".join(span.split())
-    idx = s_low.find(span_norm.lower())
+    span_norm = norm_text(span)
+    idx = sentence.lower().find(span_norm.lower())
     if idx >= 0:
         return idx, idx + len(span_norm)
-    # Fallback: allow whitespace differences.
     pattern = r"\s+".join(re.escape(part) for part in span_norm.split())
     match = re.search(pattern, sentence, flags=re.IGNORECASE)
     if match:
@@ -258,57 +206,85 @@ def find_span_bounds(sentence: str, span: Any) -> tuple[int | None, int | None]:
     return None, None
 
 
-def ordered_annotations_for_backward(parsed_forward: dict[str, Any], source_text: str) -> list[dict[str, Any]]:
+def is_full_sentence_like(span: Any, source_text: str, threshold: float = 0.85) -> bool:
+    s1 = re.sub(r"\W+", " ", norm_text(span).lower()).strip()
+    s2 = re.sub(r"\W+", " ", norm_text(source_text).lower()).strip()
+    if not s1 or not s2:
+        return False
+    if s1 == s2:
+        return True
+    return len(s1.split()) / max(1, len(s2.split())) >= threshold and (s1 in s2 or s2 in s1)
+
+
+def ordered_annotations_for_backward(parsed_forward: dict[str, Any], source_text: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
     annotations = parsed_forward.get("annotations") or []
-    ordered = []
+    ordered: list[dict[str, Any]] = []
+    dropped_full_sentence = 0
     for ann in annotations:
         if not isinstance(ann, dict):
             continue
-        ann2 = copy.deepcopy(ann)
-        start, end = find_span_bounds(source_text, ann2.get("span_text", ""))
-        ann2["span_start"] = start
-        ann2["span_end"] = end
-        ordered.append(ann2)
+        span = norm_text(ann.get("span_text", ""))
+        uid = norm_text(ann.get("union_element_id", ""))
+        if not span or not uid:
+            continue
+        if is_full_sentence_like(span, source_text):
+            dropped_full_sentence += 1
+            continue
+        start, end = find_span_bounds(source_text, span)
+        item = {
+            "annotation_id": norm_text(ann.get("annotation_id")),
+            "span_text": span,
+            "label": uid,
+            "span_relation": norm_text(ann.get("span_relation")),
+            "overlap_group_id": norm_text(ann.get("overlap_group_id")),
+            "span_start": start,
+            "span_end": end,
+        }
+        ordered.append(item)
 
     def sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
-        start = item.get("span_start")
-        end = item.get("span_end")
-        if start is None:
-            start = 10**9
-        if end is None:
-            end = start
-        # Same start: broader spans first, then narrower nested spans.
-        return (int(start), -int(end - start), str(item.get("annotation_id", "")))
+        start = item.get("span_start") if item.get("span_start") is not None else 10**9
+        end = item.get("span_end") if item.get("span_end") is not None else start
+        return int(start), -int(end - start), str(item.get("annotation_id", ""))
 
     ordered = sorted(ordered, key=sort_key)
     for i, ann in enumerate(ordered, start=1):
         ann["sentence_order_index"] = i
-    return ordered
+    audit = {"n_full_sentence_spans_dropped": dropped_full_sentence, "n_annotations_backward_eligible_strict": len(ordered)}
+    return ordered, audit
+
+
+def eligible_sentence_level_annotations(parsed_forward: dict[str, Any], has_valid_span_annotations: bool) -> list[dict[str, Any]]:
+    if not has_valid_span_annotations:
+        return []
+    out = []
+    if norm_text(parsed_forward.get("sentence_decision")):
+        out.append({"field": "sentence_decision", "value": norm_text(parsed_forward.get("sentence_decision")), "support_policy": "included_only_because_valid_span_annotations_exist"})
+    elems = parsed_forward.get("sentence_level_elements") or []
+    if isinstance(elems, list):
+        for item in elems:
+            if isinstance(item, dict):
+                val = {k: norm_text(v) for k, v in item.items() if norm_text(v)}
+                if val:
+                    val["support_policy"] = "included_only_because_valid_span_annotations_exist"
+                    out.append(val)
+    return out
 
 
 def build_backward_packet(parsed_forward: dict[str, Any], source_text: str) -> dict[str, Any]:
-    """Build the only forward-derived object allowed in the backward prompt.
-
-    The packet intentionally excludes source_text and raw_response. It keeps only
-    span evidence, labels, interpretation units, unmatched language, and validation
-    metadata, with spans ordered by their position in the original sentence.
-    """
-    masked = mask_original_sentence_in_obj(copy.deepcopy(parsed_forward), source_text)
-    ordered = ordered_annotations_for_backward(masked, source_text)
+    """Build strict, universal, annotation-only backward input."""
+    ordered, audit = ordered_annotations_for_backward(parsed_forward, source_text)
     packet = {
-        "sentence_decision": masked.get("sentence_decision", ""),
-        "sentence_level_elements": masked.get("sentence_level_elements", []),
+        "backward_input_policy": STRICT_POLICY,
         "ordered_reconstruction_items": ordered,
-        "interpretation_units": masked.get("interpretation_units", []),
-        "unmatched_language": masked.get("unmatched_language", []),
-        "invalid_annotations": masked.get("invalid_annotations", []),
-        "validation_summary": masked.get("validation_summary", {}),
-        "sanitization_note": (
-            "Original full sentence and raw forward response are not included. "
-            "ordered_reconstruction_items are sorted by the position of their span_text in the original sentence."
-        ),
+        "sentence_level_annotations": eligible_sentence_level_annotations(parsed_forward, bool(ordered)),
+        "annotation_audit": {
+            **audit,
+            "n_annotations_forward_valid": len(parsed_forward.get("annotations") or []) if isinstance(parsed_forward.get("annotations"), list) else 0,
+            "excluded_from_backward": ["unmatched_language", "interpretation_units", "combined_meaning", "rationale", "raw_forward_response", "original_sentence", "invalid_annotations"],
+        },
     }
-    return mask_original_sentence_in_obj(packet, source_text)
+    return packet
 
 
 def load_model_config(path: Path, model_key: str) -> dict[str, Any]:
@@ -337,22 +313,22 @@ def extract_json(text: str) -> dict[str, Any]:
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     try:
-        return json.loads(text)
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
         start = text.find("{")
         end = text.rfind("}")
         if start >= 0 and end > start:
-            return json.loads(text[start : end + 1])
+            obj = json.loads(text[start : end + 1])
+            if isinstance(obj, dict):
+                return obj
         raise
+    raise ValueError("Parsed JSON is not an object")
 
 
 def call_chat(client: OpenAI, model_cfg: dict[str, Any], messages: list[dict[str, str]]) -> str:
-    kwargs = {
-        "model": model_cfg["model"],
-        "messages": messages,
-        "max_tokens": int(model_cfg.get("max_tokens", 4096)),
-        "timeout": float(model_cfg.get("timeout_seconds", 120)),
-    }
+    kwargs = {"model": model_cfg["model"], "messages": messages, "max_tokens": int(model_cfg.get("max_tokens", 4096)), "timeout": float(model_cfg.get("timeout_seconds", 120))}
     if model_cfg.get("temperature") is not None:
         kwargs["temperature"] = model_cfg.get("temperature", 0)
     max_retries = int(model_cfg.get("max_retries", 3))
@@ -370,10 +346,7 @@ def call_chat(client: OpenAI, model_cfg: dict[str, Any], messages: list[dict[str
 
 
 def build_forward_messages(sentence: str, dictionary_text: str) -> list[dict[str, str]]:
-    system = (
-        "You are an NLP annotator for informed-consent documents. Your task is to consistently apply "
-        "the combined source-model data dictionary to the input sentence. Return valid JSON only."
-    )
+    system = "You are an NLP annotator for informed-consent documents. Your task is to consistently apply the combined source-model data dictionary to the input sentence. Return valid JSON only."
     user = f"""
 Task: annotate the informed-consent sentence using ONLY element IDs from the data dictionary below.
 
@@ -395,13 +368,9 @@ Annotation rules:
 - Sentence-level elements may be used only in sentence_level_elements, not as span annotations.
 - sentence_decision must be one of: permit, deny, mixed, unclear.
 
-Interpretation rules for backward mapping:
-- After producing raw annotations, create interpretation_units.
-- Each interpretation_unit should explain how related annotations should be considered together for reconstruction.
-- Use interpretation_units to decide whether overlapping labels are equivalent, complementary, broad/narrow, conflicting, or uncertain.
-- Do not merely collapse overlapping labels as redundant. Preserve specificity when a nested or narrower annotation adds meaning.
-- If two labels mean essentially the same thing for the sentence, select the interpretation that best preserves meaning and record the redundancy in rationale.
-- If one label is broad and another is narrower, preserve both in a combined meaning when both are needed.
+Audit rules:
+- You may include interpretation_units and unmatched_language for human audit.
+- These audit fields will NOT be available to the backward reconstruction evaluator.
 
 Data dictionary:
 {dictionary_text}
@@ -426,8 +395,8 @@ Return JSON with exactly this structure:
       "evidence_span_text": "span or phrase represented by this unit",
       "annotation_ids": ["a1", "a2"],
       "relationship": "single|same_span_multiple_labels|nested_broad_narrow|complementary_roles|conflicting_or_uncertain",
-      "combined_meaning": "final meaning to preserve for backward reconstruction",
-      "backward_mapping_decision": "use_as_core_meaning|use_as_modifier|preserve_broad_and_specific|choose_more_specific|choose_broader|flag_uncertain",
+      "combined_meaning": "audit only; not backward eligible",
+      "backward_mapping_decision": "audit only",
       "rationale": "brief explanation of how the annotations should be considered together"
     }}
   ],
@@ -441,36 +410,23 @@ Sentence:
 
 
 def build_backward_messages(backward_packet: dict[str, Any], dictionary_text: str) -> list[dict[str, str]]:
-    system = (
-        "You reconstruct informed-consent sentence meaning from structured annotations. "
-        "You do not see the original sentence. Return valid JSON only."
-    )
+    system = "You reconstruct informed-consent sentence meaning from annotation evidence only. You do not see the original sentence. Return valid JSON only."
     mapping_text = json.dumps(backward_packet, ensure_ascii=False, indent=2)
     user = f"""
-Task: reconstruct a concise natural-language consent sentence that preserves the meaning of the structured mapping.
+Task: reconstruct one concise natural-language consent sentence using ONLY the annotation-only mapping below.
 
-Critical leakage rule:
+Universal strict backward policy:
 - The original sentence is intentionally not provided.
-- Do not ask for or assume access to the original sentence.
-- Use only the ordered spans, labels, interpretation units, and unmatched-language fragments in the structured mapping.
+- Use only ordered_reconstruction_items and sentence_level_annotations from the mapping.
+- Do not use, infer, or request unmatched/residual language, interpretation units, rationales, combined meanings, raw forward responses, or the original sentence.
+- If ordered_reconstruction_items are empty or insufficient, return an empty reconstructed_sentence and explain that the annotations are insufficient.
+- Preserve only the meaning supported by the annotation spans and labels.
+- Do not add actors, actions, resources, purposes, conditions, restrictions, or temporal details that are not present in the annotation-only mapping.
 
-Use the mapping as follows:
-- ordered_reconstruction_items are valid dictionary-grounded annotations sorted in the same sequence as their spans appeared in the original sentence.
-- Preserve that sequence unless the interpretation_units require a small grammatical reordering.
-- interpretation_units are the primary source for deciding how overlapping or nested labels should be combined.
-- annotations are supporting evidence for exact source-model elements and span relationships.
-- invalid_annotations are not dictionary-grounded. Do not treat their invalid IDs as authoritative. Use their span text only if needed as unmatched or cautionary evidence.
-- Do not reconstruct by simply listing every annotation label.
-- If multiple labels refer to the same span and interpretation_units mark them as equivalent, express the shared meaning once.
-- If a broader span and a nested narrower span both add meaning, preserve the combined broad+narrow meaning.
-- If annotations are complementary, include all complementary meaning needed for preservation.
-- Do not add details that are not in the mapping.
-- Preserve permission/denial, action, object, actor/recipient, purpose, condition, restriction, and temporal meaning when present.
-
-Data dictionary:
+Label dictionary for interpreting annotation labels:
 {dictionary_text}
 
-Sanitized structured mapping for reconstruction:
+Annotation-only mapping for reconstruction:
 {mapping_text}
 
 Return JSON with exactly this structure:
@@ -529,23 +485,31 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
         invalid_annotations = parsed.get("invalid_annotations") or []
         units = parsed.get("interpretation_units") or []
         bwd = backward.get(source_id, {})
+        packet = bwd.get("backward_packet", {})
+        strict_items = packet.get("ordered_reconstruction_items") or []
         rows.append({
             "source_id": source_id,
             "source_text": fwd.get("source_text", ""),
+            "condition": "union_v0_strict",
             "sentence_decision": parsed.get("sentence_decision", ""),
             "n_annotations_raw": validation.get("n_annotations_raw", ""),
             "n_annotations_valid": validation.get("n_annotations_valid", ""),
             "n_annotations_repaired": validation.get("n_annotations_repaired", ""),
             "n_annotations_invalid": validation.get("n_annotations_invalid", ""),
-            "n_annotations_backward_eligible": validation.get("n_annotations_backward_eligible", ""),
+            "n_annotations_backward_eligible": len(strict_items),
+            "n_full_sentence_spans_dropped": (packet.get("annotation_audit") or {}).get("n_full_sentence_spans_dropped", ""),
             "n_interpretation_units": len(units) if isinstance(units, list) else "",
             "forward_parse_ok": fwd.get("parse_ok", False),
             "backward_parse_ok": bwd.get("parse_ok", False),
             "reconstructed_sentence": (bwd.get("parsed_backward") or {}).get("reconstructed_sentence", ""),
+            "reconstruction_notes": (bwd.get("parsed_backward") or {}).get("reconstruction_notes", ""),
+            "annotation_count": len(strict_items),
+            "unique_element_count": len({norm_text(x.get("label")) for x in strict_items if isinstance(x, dict) and norm_text(x.get("label"))}),
+            "backward_input_policy": packet.get("backward_input_policy", STRICT_POLICY),
             "annotations_json": json.dumps(annotations, ensure_ascii=False),
             "invalid_annotations_json": json.dumps(invalid_annotations, ensure_ascii=False),
             "interpretation_units_json": json.dumps(units, ensure_ascii=False),
-            "backward_packet_json": json.dumps(bwd.get("backward_packet", {}), ensure_ascii=False),
+            "backward_packet_json": json.dumps(packet, ensure_ascii=False),
             "forward_raw": fwd.get("raw_response", ""),
             "backward_raw": bwd.get("raw_response", ""),
         })
@@ -564,22 +528,9 @@ def run_forward(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], d
             raw = call_chat(client, model_cfg, build_forward_messages(row["_source_text"], dictionary_text))
             parsed_raw = extract_json(raw)
             parsed, validation = validate_forward_obj(parsed_raw, maps)
-            append_jsonl(forward_path, {
-                "source_id": source_id,
-                "source_text": row["_source_text"],
-                "model_key": model_cfg["model_key"],
-                "model": model_cfg["model"],
-                "stage": "forward",
-                "parse_ok": True,
-                "validation_summary": validation,
-                "parsed_forward": parsed,
-                "raw_response": raw,
-            })
+            append_jsonl(forward_path, {"source_id": source_id, "source_text": row["_source_text"], "model_key": model_cfg["model_key"], "model": model_cfg["model"], "stage": "forward", "parse_ok": True, "validation_summary": validation, "parsed_forward": parsed, "raw_response": raw})
             done.add(source_id)
-            print(
-                f"[forward] {i + 1}/{len(rows)} ok {source_id} "
-                f"valid={validation['n_annotations_valid']} repaired={validation['n_annotations_repaired']} invalid={validation['n_annotations_invalid']}"
-            )
+            print(f"[forward] {i + 1}/{len(rows)} ok {source_id} valid={validation['n_annotations_valid']} repaired={validation['n_annotations_repaired']} invalid={validation['n_annotations_invalid']}")
         except Exception as exc:
             append_jsonl(failures_path, {"source_id": source_id, "stage": "forward", "error": repr(exc)})
             print(f"[forward] {i + 1}/{len(rows)} FAILED {source_id}: {exc}", file=sys.stderr)
@@ -598,22 +549,15 @@ def run_backward(client: OpenAI, model_cfg: dict[str, Any], dictionary_text: str
             parsed_forward = fwd.get("parsed_forward") or {}
             source_text = fwd.get("source_text", "")
             packet = build_backward_packet(parsed_forward, source_text)
-            raw = call_chat(client, model_cfg, build_backward_messages(packet, dictionary_text))
-            parsed = extract_json(raw)
-            append_jsonl(backward_path, {
-                "source_id": source_id,
-                "source_text": source_text,
-                "model_key": model_cfg["model_key"],
-                "model": model_cfg["model"],
-                "stage": "backward",
-                "parse_ok": True,
-                "backward_input_sanitized": True,
-                "backward_packet": packet,
-                "parsed_backward": parsed,
-                "raw_response": raw,
-            })
+            if not packet.get("ordered_reconstruction_items"):
+                parsed = {"reconstructed_sentence": "", "reconstruction_notes": NO_ANNOTATION_NOTE}
+                raw = json.dumps(parsed, ensure_ascii=False)
+            else:
+                raw = call_chat(client, model_cfg, build_backward_messages(packet, dictionary_text))
+                parsed = extract_json(raw)
+            append_jsonl(backward_path, {"source_id": source_id, "source_text": source_text, "model_key": model_cfg["model_key"], "model": model_cfg["model"], "stage": "backward", "parse_ok": True, "backward_input_sanitized": True, "backward_input_policy": STRICT_POLICY, "backward_packet": packet, "parsed_backward": parsed, "raw_response": raw})
             done.add(source_id)
-            print(f"[backward] {i + 1}/{len(forward)} ok {source_id}")
+            print(f"[backward] {i + 1}/{len(forward)} ok {source_id} eligible_annotations={len(packet.get('ordered_reconstruction_items') or [])}")
         except Exception as exc:
             append_jsonl(failures_path, {"source_id": source_id, "stage": "backward", "error": repr(exc)})
             print(f"[backward] {i + 1}/{len(forward)} FAILED {source_id}: {exc}", file=sys.stderr)
@@ -648,9 +592,9 @@ def main() -> None:
         "n_union_elements": int(len(inv)),
         "inventory_csv": args.inventory_csv,
         "roundtrips_csv": args.roundtrips_csv,
-        "prompt_design": "overlap_aware_raw_annotations_plus_interpretation_units",
+        "prompt_design": "overlap_aware_raw_annotations_plus_audit_interpretation_units_not_backward_eligible",
         "id_validation": "repair_unambiguous_ids_and_flag_remaining_invalid",
-        "backward_input": "sanitized_packet_no_original_sentence_no_raw_forward_response_ordered_by_span_position",
+        "backward_input": STRICT_POLICY,
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(run_meta, indent=2))
 
@@ -659,11 +603,7 @@ def main() -> None:
     if args.stage in {"backward", "both"}:
         run_backward(client, model_cfg, dictionary_text, output_dir)
 
-    write_roundtrip_csv(
-        output_dir / "union_v0_forward_mappings.jsonl",
-        output_dir / "union_v0_backward_reconstructions.jsonl",
-        output_dir / "union_v0_roundtrip_outputs.csv",
-    )
+    write_roundtrip_csv(output_dir / "union_v0_forward_mappings.jsonl", output_dir / "union_v0_backward_reconstructions.jsonl", output_dir / "union_v0_roundtrip_outputs.csv")
     print(f"Wrote outputs under {output_dir}")
 
 
