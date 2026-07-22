@@ -3,6 +3,8 @@
 
 This wrapper reuses 05_run_individual_model_roundtrip.py and only swaps the chat
 client. Use it for model config entries with provider: mayo_apigee_azure_openai.
+Backward reconstruction inherits the universal strict annotation-only policy from
+05_run_individual_model_roundtrip.py.
 """
 from __future__ import annotations
 
@@ -68,9 +70,10 @@ def main() -> None:
         "info_models": info_models,
         "roundtrips_csv": args.roundtrips_csv,
         "prompt_dir": args.prompt_dir,
-        "backward_prompt_dir": args.backward_prompt_dir,
+        "backward_prompt_dir_deprecated_not_used": args.backward_prompt_dir,
         "stage": args.stage,
-        "backward_input": "sanitized_forward_output_no_original_sentence_exact_sentence_echoes_masked_json_or_csv_ordered_when_parseable",
+        "backward_input": mod.STRICT_POLICY,
+        "backward_prompt": "universal_strict_annotation_only",
         "chat_transport": "mayo_apigee_azure_openai",
     }, indent=2))
 
@@ -84,9 +87,9 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "prompt_files.json").write_text(json.dumps({
             "forward_prompt_file": str(prompt_path),
-            "backward_prompt_file": str(backward_path) if backward_path else None,
-            "uses_generic_backward_prompt": backward_path is None,
-            "backward_input_sanitized": True,
+            "backward_prompt_file_deprecated_not_used": str(backward_path) if backward_path else None,
+            "uses_universal_strict_backward_prompt": True,
+            "backward_input_policy": mod.STRICT_POLICY,
         }, indent=2))
         mod.run_info_model(rows, client, model_cfg, info_model, prompt_text, backward_text, out_dir, args.stage)
 
