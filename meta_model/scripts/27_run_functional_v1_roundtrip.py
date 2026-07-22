@@ -1,18 +1,15 @@
 #!/usr/bin/env python
-"""Run forward/backward round-trip assessment using a functional V1 schema.
+"""Run forward/backward round-trip assessment using a functional schema.
 
 Forward mapping may include rich audit material for human review. Backward
-evaluation is strict and universal across all schema experiments: it receives only
-valid span-level annotations, optional annotation-attached modifiers, and
-sentence-level annotations only when at least one valid span annotation exists.
-It does not receive unmatched_language, residual text, interpretation_units,
-combined_meaning, rationales, raw forward text, previous reconstructions, or the
-original sentence.
+evaluation is strict and universal: it receives only an annotation-only mapping
+built from valid span annotations, annotation-attached modifiers when present,
+and eligible sentence-level annotations. Rows with no backward-eligible
+annotations are not sent to the LLM; their reconstruction is intentionally blank.
 """
 from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import hashlib
 import json
@@ -37,8 +34,30 @@ except ImportError:  # pragma: no cover
 
 TEXT_COLS = ["canonical_full_text", "full_text_original", "original_sentence", "source_text", "full_text", "sentence", "text"]
 ID_COLS = ["sentence_id", "source_sentence_id", "roundtrip_id", "source_id", "id"]
-STRICT_POLICY = "strict_annotation_only_no_unmatched_language_no_interpretation_units_no_rationales"
-NO_ANNOTATION_NOTE = "No valid backward-eligible annotations were available; reconstruction intentionally left blank."
+STRICT_POLICY = "strict_annotation_only"
+NO_ANNOTATION_NOTE = "Annotation evidence was empty or insufficient."
+
+UNIVERSAL_BACKWARD_SYSTEM = (
+    "You reconstruct informed-consent sentence meaning from an annotation-only mapping. "
+    "Return valid JSON only."
+)
+UNIVERSAL_BACKWARD_USER_TEMPLATE = """
+Task: reconstruct one concise natural-language consent sentence using only the annotation-only mapping below.
+
+Instructions:
+- Use only information explicitly present in the annotation-only mapping.
+- Preserve the order indicated by sentence_order_index when available.
+- If the annotation evidence is empty or insufficient, return an empty reconstructed_sentence and explain that annotation evidence was insufficient.
+
+Annotation-only mapping:
+{mapping_text}
+
+Return JSON with exactly this structure:
+{{
+  "reconstructed_sentence": "...",
+  "reconstruction_notes": "brief note or empty string"
+}}
+""".strip()
 
 
 def norm(x: Any) -> str:
@@ -203,12 +222,12 @@ def evidence_rules(mode: str, max_tokens: int) -> str:
 - Prefer short atomic evidence spans, ideally <= {max_tokens} tokens.
 - Do not copy the full sentence into one annotation.
 - Split a phrase when it contains multiple functions, e.g. action + resource + repository.
-- Use residual_important_content only for forward-audit purposes; it will not be backward-eligible."""
+- Use residual_important_content only for forward audit; it will not be included in the annotation-only backward mapping."""
     return """Evidence-span rules:
 - Evidence spans may be longer when needed to preserve condition, exception, temporal, privacy, or governance meaning.
 - Do not copy the full sentence verbatim into a single annotation.
 - Split complementary functions whenever possible.
-- Use residual_important_content only for forward-audit purposes; it will not be backward-eligible."""
+- Use residual_important_content only for forward audit; it will not be included in the annotation-only backward mapping."""
 
 
 def forward_messages(sentence: str, dictionary: str, field_names: list[str], mode: str, max_tokens: int) -> list[dict[str, str]]:
@@ -260,7 +279,7 @@ Return JSON with exactly this structure:
       "evidence_span_text": "span or phrase represented by this unit",
       "annotation_ids": ["a1"],
       "relationship": "single|same_span_multiple_fields|nested_broad_narrow|complementary_fields|conflicting_or_uncertain",
-      "combined_meaning": "audit only; not backward eligible",
+      "combined_meaning": "audit only",
       "rationale": "brief explanation"
     }}
   ],
@@ -304,11 +323,13 @@ def ordered_annotations(parsed: dict[str, Any], source: str) -> tuple[list[dict[
         field = norm(ann.get("field_name") or ann.get("field_id") or ann.get("label"))
         if not span or not field:
             continue
+        if field in {"residual_important_content", "provenance"}:
+            continue
         if is_full_sentence_like(span, source):
             dropped_full += 1
             continue
         start, end = span_bounds(source, span)
-        x = {
+        rows.append({
             "annotation_id": norm(ann.get("annotation_id")),
             "span_text": span,
             "label": field,
@@ -317,8 +338,7 @@ def ordered_annotations(parsed: dict[str, Any], source: str) -> tuple[list[dict[
             "overlap_group_id": norm(ann.get("overlap_group_id")),
             "span_start": start,
             "span_end": end,
-        }
-        rows.append(x)
+        })
     rows = sorted(rows, key=lambda x: (10**9 if x.get("span_start") is None else int(x.get("span_start")), 0 if x.get("span_end") is None else -int(x.get("span_end") - (x.get("span_start") or 0)), str(x.get("annotation_id", ""))))
     for i, x in enumerate(rows, start=1):
         x["sentence_order_index"] = i
@@ -330,55 +350,33 @@ def eligible_sentence_level_annotations(parsed: dict[str, Any], has_valid_span_a
         return []
     out = []
     if norm(parsed.get("sentence_decision")):
-        out.append({"field": "sentence_decision", "value": norm(parsed.get("sentence_decision")), "support_policy": "included_only_because_valid_span_annotations_exist"})
+        out.append({"field": "sentence_decision", "value": norm(parsed.get("sentence_decision")), "support": "valid_span_annotations_present"})
     elems = parsed.get("sentence_level_elements") or []
     if isinstance(elems, list):
         for item in elems:
             if isinstance(item, dict):
                 d = {k: v for k, v in item.items() if norm(v)}
                 if d:
-                    d["support_policy"] = "included_only_because_valid_span_annotations_exist"
+                    d["support"] = "valid_span_annotations_present"
                     out.append(d)
     return out
 
 
-def backward_packet(parsed: dict[str, Any], source: str, mode: str) -> dict[str, Any]:
+def backward_packet(parsed: dict[str, Any], source: str, mode: str) -> tuple[dict[str, Any], dict[str, Any]]:
     ordered, audit = ordered_annotations(parsed, source)
-    return {
+    packet = {
         "backward_input_policy": STRICT_POLICY,
         "ordered_reconstruction_items": ordered,
         "sentence_level_annotations": eligible_sentence_level_annotations(parsed, bool(ordered)),
-        "annotation_audit": {**audit, "evidence_mode": mode, "excluded_from_backward": ["unmatched_language", "interpretation_units", "combined_meaning", "rationale", "raw_forward_response", "original_sentence"]},
     }
+    audit = {**audit, "evidence_mode": mode, "n_sentence_level_annotations_backward_eligible": len(packet["sentence_level_annotations"])}
+    return packet, audit
 
 
-def backward_messages(packet: dict[str, Any], dictionary: str) -> list[dict[str, str]]:
-    system = "You reconstruct informed-consent sentence meaning from annotation evidence only. You do not see the original sentence. Return valid JSON only."
+def backward_messages(packet: dict[str, Any]) -> list[dict[str, str]]:
     mapping = json.dumps(packet, ensure_ascii=False, indent=2)
-    user = f"""
-Task: reconstruct one concise natural-language consent sentence using ONLY the annotation-only mapping below.
-
-Universal strict backward policy:
-- The original sentence is intentionally not provided.
-- Use only ordered_reconstruction_items and sentence_level_annotations from the mapping.
-- Do not use, infer, or request unmatched/residual language, interpretation units, rationales, combined meanings, raw forward responses, or the original sentence.
-- If ordered_reconstruction_items are empty or insufficient, return an empty reconstructed_sentence and explain that the annotations are insufficient.
-- Preserve only the meaning supported by the annotation spans, labels, and attached canonical modifiers.
-- Do not add actors, actions, resources, purposes, conditions, restrictions, or temporal details that are not present in the annotation-only mapping.
-
-Label dictionary for interpreting annotation labels:
-{dictionary}
-
-Annotation-only mapping for reconstruction:
-{mapping}
-
-Return JSON with exactly this structure:
-{{
-  "reconstructed_sentence": "...",
-  "reconstruction_notes": "brief note or empty string"
-}}
-""".strip()
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    user = UNIVERSAL_BACKWARD_USER_TEMPLATE.format(mapping_text=mapping)
+    return [{"role": "system", "content": UNIVERSAL_BACKWARD_SYSTEM}, {"role": "user", "content": user}]
 
 
 def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
@@ -432,6 +430,7 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path, mode: str)
         b = bwd.get(source_id, {})
         n, u = count_fields(parsed)
         packet = b.get("backward_packet", {})
+        audit = b.get("backward_annotation_audit", {})
         strict_items = packet.get("ordered_reconstruction_items") or []
         rows.append({
             "source_id": source_id,
@@ -443,7 +442,7 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path, mode: str)
             "n_unique_roles": u,
             "annotation_count": len(strict_items),
             "unique_element_count": len({norm(x.get("label")) for x in strict_items if isinstance(x, dict) and norm(x.get("label"))}),
-            "n_full_sentence_spans_dropped": (packet.get("annotation_audit") or {}).get("n_full_sentence_spans_dropped", ""),
+            "n_full_sentence_spans_dropped": audit.get("n_full_sentence_spans_dropped", ""),
             "forward_parse_ok": f.get("parse_ok", False),
             "backward_parse_ok": b.get("parse_ok", False),
             "reconstructed_sentence": (b.get("parsed_backward") or {}).get("reconstructed_sentence", ""),
@@ -451,6 +450,7 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path, mode: str)
             "backward_input_policy": packet.get("backward_input_policy", STRICT_POLICY),
             "v1_mapping_json": json.dumps(parsed, ensure_ascii=False),
             "backward_packet_json": json.dumps(packet, ensure_ascii=False),
+            "backward_annotation_audit_json": json.dumps(audit, ensure_ascii=False),
             "forward_raw": f.get("raw_response", ""),
             "backward_raw": b.get("raw_response", ""),
         })
@@ -476,6 +476,7 @@ def run_forward(rows: pd.DataFrame, client: Any, cfg: dict[str, Any], dictionary
 
 
 def run_backward(rows: pd.DataFrame, client: Any, cfg: dict[str, Any], dictionary: str, mode: str, out_dir: Path) -> None:
+    _ = dictionary
     fwd_path = out_dir / "functional_v1_forward_mappings.jsonl"
     bwd_path = out_dir / "functional_v1_backward_reconstructions.jsonl"
     failures = out_dir / "failed_requests.jsonl"
@@ -488,14 +489,14 @@ def run_backward(rows: pd.DataFrame, client: Any, cfg: dict[str, Any], dictionar
             f = fwd[source_id]
             source_text = f.get("source_text", "")
             parsed = f.get("parsed_forward") or extract_json(f.get("raw_response", ""))
-            packet = backward_packet(parsed, source_text, mode)
+            packet, audit = backward_packet(parsed, source_text, mode)
             if not packet.get("ordered_reconstruction_items"):
                 parsed_back = {"reconstructed_sentence": "", "reconstruction_notes": NO_ANNOTATION_NOTE}
                 raw = json.dumps(parsed_back, ensure_ascii=False)
             else:
-                raw = call_chat(client, cfg, backward_messages(packet, dictionary))
+                raw = call_chat(client, cfg, backward_messages(packet))
                 parsed_back = extract_json(raw)
-            append_jsonl(bwd_path, {"source_id": source_id, "source_text": source_text, "model_key": cfg["model_key"], "model": cfg.get("model", cfg["model_key"]), "condition": f"functional_v1_{mode}_strict", "evidence_mode": mode, "stage": "backward", "parse_ok": True, "backward_input_policy": STRICT_POLICY, "parsed_backward": parsed_back, "backward_packet": packet, "raw_response": raw})
+            append_jsonl(bwd_path, {"source_id": source_id, "source_text": source_text, "model_key": cfg["model_key"], "model": cfg.get("model", cfg["model_key"]), "condition": f"functional_v1_{mode}_strict", "evidence_mode": mode, "stage": "backward", "parse_ok": True, "backward_input_policy": STRICT_POLICY, "parsed_backward": parsed_back, "backward_packet": packet, "backward_annotation_audit": audit, "raw_response": raw})
             print(f"[Functional V1 {mode} backward] {i+1}/{len(rows)} ok {source_id} eligible_annotations={len(packet.get('ordered_reconstruction_items') or [])}")
         except Exception as exc:
             append_jsonl(failures, {"stage": "backward", "source_id": source_id, "error": repr(exc), "evidence_mode": mode})
@@ -522,7 +523,7 @@ def main() -> None:
     dictionary, field_names = load_field_dictionary(Path(args.metamodel_yaml))
     out_dir = Path(args.output_dir) / args.model_key / args.evidence_mode
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "run_metadata.json").write_text(json.dumps({"model_key": args.model_key, "model": cfg.get("model"), "evidence_mode": args.evidence_mode, "stage": args.stage, "roundtrips_csv": args.roundtrips_csv, "metamodel_yaml": args.metamodel_yaml, "backward_input": STRICT_POLICY, "backward_prompt": "universal_strict_annotation_only"}, indent=2))
+    (out_dir / "run_metadata.json").write_text(json.dumps({"model_key": args.model_key, "model": cfg.get("model"), "evidence_mode": args.evidence_mode, "stage": args.stage, "roundtrips_csv": args.roundtrips_csv, "metamodel_yaml": args.metamodel_yaml, "backward_input": STRICT_POLICY, "backward_prompt": "minimal_universal_annotation_only"}, indent=2))
 
     if args.stage in {"forward", "both"}:
         run_forward(rows, client, cfg, dictionary, field_names, args.evidence_mode, args.max_evidence_tokens, out_dir)
