@@ -4,17 +4,48 @@ This folder contains the workflow for developing, crosswalking, and evaluating r
 
 ## Current paper-facing framing
 
-The current reduced-model experiments compare two data-seeded functional schema derivation strategies:
+The active evaluation has been reset around a strict annotation-only backward reconstruction rule. Earlier round-trip outputs that exposed `interpretation_units`, `unmatched_language`, residual text, or free-text combined meanings to the backward LLM are treated as exploratory/leakage-contaminated and should not be used for final performance claims.
+
+The next paper-facing comparison is organized as:
 
 ```text
-Manual Functional V1:
-  form-level CV evidence -> manually organized functional schema -> expert review
+Phase 1 baselines:
+  existing individual DUO / ICO / ODRL / FHIR forward mappings -> strict annotation-only backward reconstruction
+  existing Union V0 forward mappings -> strict annotation-only backward reconstruction
 
-LLM-Induced Functional V1:
-  same form-level CV evidence -> evidence cards -> fixed strong LLM induction/critique/revision -> expert review
+Phase 2 schema induction:
+  strict-preserved valid annotation evidence -> source-element senses -> typed pairwise relationships -> evidence cards
+  direct LLM schema induction from source dictionaries + examples
+  data-driven LLM schema induction from empirical evidence cards
+
+Phase 3 evaluation and expert review:
+  constant universal strict backward prompt across all schema strategies
+  expert assessment of schema dictionaries, source-model crosswalks, and examples
 ```
 
-Both reduced schemas are compared with individual source models and Union V0 under controlled round-trip evaluation. For all round-trip experiments, the prompt template should remain constant within the experiment family; only the schema/dictionary changes.
+## Non-negotiable strict backward rule
+
+For every experiment family, the backward prompt must be universal and must receive only backward-eligible annotation evidence:
+
+```text
+Allowed:
+  valid span-level annotations
+  annotation labels / field IDs
+  canonical modifiers attached to valid annotations, when present
+  sentence-level annotations only when at least one valid span annotation exists
+
+Excluded:
+  original sentence
+  raw forward response
+  unmatched_language / residual text
+  interpretation_units
+  combined_meaning
+  rationales
+  previous reconstruction
+  unanchored sentence_decision
+```
+
+Rows with no backward-eligible span annotations are not sent to the LLM. Their reconstruction is intentionally blank. This prevents residual-only mappings from receiving inflated meaning-preservation scores.
 
 ## Key methodological principle
 
@@ -24,82 +55,81 @@ The goal is not to find the smallest number of clusters. The goal is to derive s
 meaning-critical
 specific enough to avoid unsafe role overlap
 complementary rather than redundant
-supported by source-model and round-trip evidence
+supported by source-model and strict round-trip evidence
 translatable from ICO / DUO / FHIR Consent / ODRL
 generalizable to unseen consent forms
 ```
 
-The pipeline therefore distinguishes:
+The data-driven pipeline therefore distinguishes:
 
 ```text
-near-equivalence      -> can support field consolidation
+near-equivalence      -> can support seed clustering
 co-occurrence         -> provision-bundle/complementarity evidence, not direct merging
+proximity             -> local relationship evidence, not direct merging
 broader/narrower      -> hierarchy/scope evidence
 related-but-distinct  -> unsafe or uncertain merge
+modifier attributes   -> characterize annotations/frames, not source-model nodes to cluster
 ```
 
 ## Active evidence path
 
 ```text
-original researcher workbooks
--> clean expert round-trip corpus
--> form-level CV splits using stable form_key
--> training-fold mention evidence
--> decision-marker stripping and sentence_decision evidence
--> context-specific source-element senses
--> typed relationships and provision-bundle co-occurrence
--> strict selected semantic neighborhoods
--> Manual Functional V1 candidate schema
--> source-model-to-V1 crosswalk
+existing individual-model and Union V0 forward mappings
+-> strict annotation-only backward rerun for baselines
+-> classifier scoring and diagnostic metrics for baselines
+-> strict-preserved valid annotation evidence table
+-> source-element-sense induction
+-> pairwise evidence features: same-span, overlap, nesting, proximity, PMI/lift, semantic similarity, role signatures
+-> typed pairwise relationships
+-> near-equivalence seed clusters only
+-> complementary/proximity graph for functional bundles
 -> LLM schema-induction evidence cards
--> LLM-induced Functional V1 candidate schema
--> held-out forward/backward evaluation for both reduced schemas
--> meaning-preservation classifier scoring and multi-layer preservation metrics
--> PI/domain-expert review and consensus V1.1
+-> direct LLM high/low granularity reduced schemas
+-> data-driven LLM high/low granularity reduced schemas
+-> strict forward/backward evaluation under a constant universal backward prompt
+-> PI/domain-expert review and consensus schema
 ```
 
 ## Active scripts
 
 ```text
-12_build_expert_roundtrip_corpus.py      # original workbooks -> clean expert corpus
-23_refined_metamodel_cv_pipeline.py      # folds, mention evidence, sense nodes, typed graph, fold schemas
-24_refined_cv_postprocess.py             # repair form aliases and select stable fold candidates
-25_make_heldout_roundtrips.py            # create held-out roundtrip CSVs by fold
-26_build_functional_v1_crosswalk.py      # map ICO/DUO/FHIR/ODRL source elements to functional V1 fields
-27_run_functional_v1_roundtrip.py        # held-out forward/backward assessment using any functional V1 schema
-28_build_llm_schema_induction_cards.py   # selected fold evidence -> evidence cards for LLM induction
-29_induce_functional_schema_with_llm.py  # induce, critique, revise, and validate LLM-induced schema
-30_relabel_functional_v1_outputs.py      # relabel output metadata without changing prompts
+03_run_union_v0_roundtrip.py              # Union V0; backward is strict annotation-only
+05_run_individual_model_roundtrip.py      # individual source models; backward is strict annotation-only
+12_run_union_v0_roundtrip_apigee.py       # Apigee wrapper; inherits strict Union V0 backward policy
+13_run_individual_model_roundtrip_apigee.py # Apigee wrapper; inherits strict individual backward policy
+27_run_functional_v1_roundtrip.py         # functional schemas; backward is strict annotation-only
+09_score_roundtrip_outputs.py             # classifier scoring
+32_compute_roundtrip_diagnostic_metrics.py # diagnostic metrics
 31_compile_schema_condition_comparison.py # summarize scored schema-condition results
-07_standardize_roundtrip_outputs.py      # standardize conditions for classifier scoring
-16_audit_annotation_granularity.py       # compare annotation burden/granularity
 ```
 
-Older coarse cluster-ID schema builders and cluster-ID smoke-test runners are no longer part of the active workflow. They were useful for diagnosis, but the paper-facing models are functional V1 schemas.
+Older coarse cluster-ID schema builders, residual-enabled backward packets, and leakage-contaminated package outputs are no longer part of the paper-facing workflow. Preserve them only in an archive folder for provenance.
 
-## Core schema and methods documents
+## Core current documents
 
 ```text
+meta_model/STRICT_BASELINE_PHASE1_RUNBOOK.md
+meta_model/PIPELINE_STAGE_TRACKER.md
+meta_model/PIPELINE_STAGE_TRACKER.csv
 meta_model/FUNCTIONAL_V1_METHODS.md
-meta_model/FUNCTIONAL_V1_ROUNDTRIP_RUNBOOK.md
-meta_model/MANUAL_VS_LLM_INDUCED_V1_EXPERIMENT_RUNBOOK.md
-meta_model/REFINED_CV_POSTPROCESS_RUNBOOK.md
-meta_model/schemas/reduced_functional_v1_candidate.yaml
+meta_model/DIAGNOSTIC_EVALUATION_RUNBOOK.md
 ```
 
 ## Baselines and comparisons
 
-The final comparison should include:
+The corrected final comparison should include:
 
 ```text
-individual DUO
-individual ICO
-individual ODRL
-individual FHIR Consent
-Union V0 full dictionary
-Manual Functional V1
-LLM-Induced Functional V1
-expert-reviewed consensus V1.1, if finalized
+individual DUO strict baseline
+individual ICO strict baseline
+individual ODRL strict baseline
+individual FHIR Consent strict baseline
+Union V0 strict baseline
+Direct LLM induced schema, high granularity
+Direct LLM induced schema, low granularity
+Data-driven LLM induced schema, high granularity
+Data-driven LLM induced schema, low granularity
+expert-reviewed consensus schema, if finalized
 ```
 
-Evaluation should include the meaning-preservation classifier, but not rely on it alone. Additional metrics include content-word preservation, consent cue preservation, annotation coverage, annotation burden, same-span overlap, unmatched-language rate, and relationship/attachment errors.
+Evaluation should include the meaning-preservation classifier, but not rely on it alone. Additional metrics include content-word preservation, consent cue preservation, annotation coverage, annotation burden, strict backward-eligible annotation counts, full-sentence span drops, and relationship/attachment errors.
