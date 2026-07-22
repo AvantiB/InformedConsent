@@ -1,0 +1,28 @@
+stage_id,phase,task,status,owner,updated_date,notes
+P0.1,Reset/archive,Freeze old leakage-contaminated outputs,planned,Avanti,2026-07-22,Archive outputs generated before strict annotation-only backward policy; do not use for final claims.
+P0.2,Reset/archive,Create fresh strict_annotation_only_experiments root,planned,Avanti,2026-07-22,Use fresh root to avoid intermingling old and new outputs.
+P0.3,Documentation,Update README with strict backward policy,done,ChatGPT,2026-07-22,meta_model/README.md updated.
+P0.4,Documentation,Create strict baseline Phase 1 runbook,done,ChatGPT,2026-07-22,meta_model/STRICT_BASELINE_PHASE1_RUNBOOK.md added.
+P1.1,Baseline strict rerun,Import/copy existing Union V0 forward outputs into fresh root,planned,Avanti,2026-07-22,Copy only union_v0_forward_mappings.jsonl into strict root.
+P1.2,Baseline strict rerun,Import/copy existing individual-model forward outputs into fresh root,planned,Avanti,2026-07-22,Copy only forward_mappings.jsonl for DUO/ICO/ODRL/FHIR_Consent into strict root.
+P1.3,Baseline strict rerun,Rerun Union V0 backward with strict annotation-only input,planned,Avanti,2026-07-22,Use 03_run_union_v0_roundtrip.py or 12_run_union_v0_roundtrip_apigee.py with --stage backward.
+P1.4,Baseline strict rerun,Rerun individual-model backward with strict annotation-only input,planned,Avanti,2026-07-22,Use 05_run_individual_model_roundtrip.py or 13_run_individual_model_roundtrip_apigee.py with --stage backward.
+P1.5,Baseline strict rerun,Standardize strict baseline outputs,planned,Avanti,2026-07-22,Run 07_standardize_roundtrip_outputs.py on the strict root.
+P1.6,Baseline strict rerun,Score strict baseline outputs with final classifier,planned,Avanti,2026-07-22,Run 09_score_roundtrip_outputs.py.
+P1.7,Baseline strict rerun,Compute diagnostic metrics for strict baseline outputs,planned,Avanti,2026-07-22,Run 32_compute_roundtrip_diagnostic_metrics.py.
+P1.8,Baseline strict rerun,Compile Phase 1 baseline comparison summaries,planned,Avanti,2026-07-22,Run 31_compile_schema_condition_comparison.py.
+P2.1,Data-driven schema induction,Build strict-preserved valid annotation evidence table,not_started,Avanti/ChatGPT,2026-07-22,Use only strict backward-scored preserved rows and valid span annotations; exclude unmatched and interpretation_units.
+P2.2,Data-driven schema induction,Induce source-element senses,not_started,Avanti/ChatGPT,2026-07-22,Split broad nodes such as Party into contextual senses.
+P2.3,Data-driven schema induction,Compute pairwise evidence features,not_started,Avanti/ChatGPT,2026-07-22,Same-span overlap nesting proximity PMI/lift semantic similarity role signatures support.
+P2.4,Data-driven schema induction,Type pairwise relationships,not_started,Avanti/ChatGPT,2026-07-22,near_equivalent broader_narrower complementary related_context_only unsafe_to_merge.
+P2.5,Data-driven schema induction,Cluster only near-equivalence relationships,not_started,Avanti/ChatGPT,2026-07-22,Do not cluster co-occurrence/proximity edges.
+P2.6,Data-driven schema induction,Build data-driven LLM induction evidence cards,not_started,Avanti/ChatGPT,2026-07-22,Evidence cards should include cluster support complementarity neighbors examples and audit flags.
+P3.1,Schema generation,Direct LLM high-granularity schema induction,not_started,Avanti/ChatGPT,2026-07-22,Input: source dictionaries plus training-fold representative sentences.
+P3.2,Schema generation,Direct LLM low-granularity schema induction,not_started,Avanti/ChatGPT,2026-07-22,Input: source dictionaries plus training-fold representative sentences.
+P3.3,Schema generation,Data-driven LLM high-granularity schema induction,not_started,Avanti/ChatGPT,2026-07-22,Input: data-driven evidence cards.
+P3.4,Schema generation,Data-driven LLM low-granularity schema induction,not_started,Avanti/ChatGPT,2026-07-22,Input: data-driven evidence cards.
+P4.1,Generated schema evaluation,Run generated-schema forward mappings,not_started,Avanti,2026-07-22,Use constant forward template within generated-schema family; only schema changes.
+P4.2,Generated schema evaluation,Run generated-schema strict backward reconstruction,not_started,Avanti,2026-07-22,Universal strict annotation-only backward prompt for all schemas.
+P4.3,Generated schema evaluation,Score generated-schema outputs,not_started,Avanti,2026-07-22,Same classifier and diagnostics as baselines.
+P5.1,Expert review,Prepare expert package with candidate schemas crosswalks and examples,not_started,Avanti/ChatGPT,2026-07-22,Do after strict results are complete.
+P5.2,Expert review,Collect expert feedback and finalize consensus schema,not_started,Avanti/PI,2026-07-22,Final schema can be described as expert-reviewed/validated after review.
