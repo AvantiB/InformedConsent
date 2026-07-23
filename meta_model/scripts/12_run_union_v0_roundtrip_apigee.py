@@ -66,9 +66,9 @@ def main() -> None:
         "inventory_csv": args.inventory_csv,
         "roundtrips_csv": args.roundtrips_csv,
         "prompt_design": "overlap_aware_forward_with_audit_fields",
-        "id_validation": "repair_unambiguous_ids_and_flag_remaining_invalid",
+        "id_validation": "exact_alias_normalized_repair_then_flag_unresolved",
         "backward_input": mod.STRICT_POLICY,
-        "backward_prompt": "minimal_universal_annotation_only",
+        "backward_prompt": "universal_annotation_dictionary_relationships",
         "chat_transport": "mayo_apigee_azure_openai",
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(run_meta, indent=2))
@@ -77,7 +77,7 @@ def main() -> None:
     if args.stage in {"forward", "both"}:
         mod.run_forward(rows, client, model_cfg, dictionary_text, maps, output_dir)
     if args.stage in {"backward", "both"}:
-        mod.run_backward(client, model_cfg, dictionary_text, output_dir)
+        mod.run_backward(client, model_cfg, dictionary_text, maps, output_dir)
 
     mod.write_roundtrip_csv(output_dir / "union_v0_forward_mappings.jsonl", output_dir / "union_v0_backward_reconstructions.jsonl", output_dir / "union_v0_roundtrip_outputs.csv")
     print(f"Wrote outputs under {output_dir}")
