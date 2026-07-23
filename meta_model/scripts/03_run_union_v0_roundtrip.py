@@ -2,10 +2,14 @@
 """Run Union V0 full-dictionary forward/backward round-trip experiments.
 
 Forward mapping remains overlap-aware and may include rich audit material for
-human review. Backward evaluation uses one universal structured protocol: valid
-span annotations enriched with static dictionary metadata, sanitized relationship
-links, and eligible sentence-level annotations. Rows with no backward-eligible
-annotations are not sent to the LLM; their reconstruction is intentionally blank.
+human review. The forward output is validated against the authoritative Union V0
+inventory table: every span annotation must use a valid union_element_id and,
+for fresh runs, should also return the exact source_element_label copied from
+the same inventory row. Backward evaluation uses one universal structured
+protocol: valid span annotations enriched with static dictionary metadata,
+sanitized relationship links, and eligible sentence-level annotations. Rows with
+no backward-eligible annotations are not sent to the LLM; their reconstruction is
+intentionally blank.
 """
 from __future__ import annotations
 
@@ -93,6 +97,10 @@ def norm_text(x: Any) -> str:
     return " ".join(str(x).split())
 
 
+def norm_label(x: Any) -> str:
+    return norm_text(x).casefold()
+
+
 def pick_col(df: pd.DataFrame, candidates: list[str], required: bool = True) -> str | None:
     lower = {c.lower(): c for c in df.columns}
     for cand in candidates:
@@ -136,13 +144,20 @@ def load_inventory(inventory_csv: Path) -> pd.DataFrame:
 
 
 def build_dictionary_text(inv: pd.DataFrame) -> str:
-    lines = []
+    lines = [
+        "Authoritative Union V0 dictionary. Each row has:",
+        "union_element_id | source_model | source_element_label | source_element_definition",
+        "Copy both union_element_id and source_element_label verbatim into every annotation.",
+        "",
+    ]
     for _, row in inv.iterrows():
         scope = row.get("element_scope", "span") or "span"
         label = norm_text(row["source_element_label"])
         definition = norm_text(row["source_element_definition"])
-        desc = f"{label}: {definition}" if definition else label
-        lines.append(f"- {row['union_element_id']} [{row['source_model']}; {scope}] {desc}")
+        lines.append(
+            f"- union_element_id={row['union_element_id']} | source_model={row['source_model']} | "
+            f"source_element_label={label} | element_scope={scope} | source_element_definition={definition}"
+        )
     return "\n".join(lines)
 
 
@@ -182,6 +197,8 @@ def build_inventory_maps(inv: pd.DataFrame) -> dict[str, Any]:
     by_pair: dict[tuple[str, str], str] = {}
     by_source_id: dict[str, list[str]] = {}
     normalized_index: dict[str, set[str]] = {}
+    by_label: dict[str, list[str]] = {}
+    by_source_label: dict[tuple[str, str], list[str]] = {}
     metadata_by_union_id: dict[str, dict[str, Any]] = {}
     for _, row in inv.iterrows():
         source_model = str(row["source_model"])
@@ -189,6 +206,8 @@ def build_inventory_maps(inv: pd.DataFrame) -> dict[str, Any]:
         source_label = str(row["source_element_label"])
         union_element_id = str(row["union_element_id"])
         metadata_by_union_id[union_element_id] = metadata_from_row(row)
+        by_label.setdefault(norm_label(source_label), []).append(union_element_id)
+        by_source_label.setdefault((source_model.casefold(), norm_label(source_label)), []).append(union_element_id)
         aliases = {source_model, source_model.replace("_Consent", ""), source_model.replace("_", "")}
         for alias in aliases:
             by_pair[(alias, source_element_id)] = union_element_id
@@ -208,32 +227,87 @@ def build_inventory_maps(inv: pd.DataFrame) -> dict[str, Any]:
         "by_pair": by_pair,
         "by_source_id": by_source_id,
         "normalized_index": normalized_index,
+        "by_label": by_label,
+        "by_source_label": by_source_label,
         "metadata_by_union_id": metadata_by_union_id,
     }
 
 
-def repair_union_id(uid: Any, maps: dict[str, Any]) -> tuple[str, str, str]:
+def returned_source_label(ann: dict[str, Any]) -> str:
+    for key in ["source_element_label", "label_name", "element_label"]:
+        value = norm_text(ann.get(key))
+        if value:
+            return value
+    return ""
+
+
+def label_matches_union_id(label: str, union_id: str, maps: dict[str, Any]) -> bool:
+    if not label:
+        return True
+    meta = maps["metadata_by_union_id"].get(union_id, {})
+    return norm_label(label) == norm_label(meta.get("label_name", ""))
+
+
+def parse_source_model_from_id(uid: str) -> str:
+    if "::" in uid:
+        return uid.split("::", 1)[0]
+    if ":" in uid:
+        return uid.split(":", 1)[0]
+    return ""
+
+
+def unique_label_match(label: str, source_model_hint: str, maps: dict[str, Any]) -> str | None:
+    if not label:
+        return None
+    if source_model_hint:
+        matches = maps["by_source_label"].get((source_model_hint.casefold(), norm_label(label)), [])
+        if len(matches) == 1:
+            return matches[0]
+    matches = maps["by_label"].get(norm_label(label), [])
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def repair_union_id(uid: Any, label: str, maps: dict[str, Any]) -> tuple[str, str, str]:
     if not isinstance(uid, str):
         return str(uid), "invalid", "not_string"
     uid = uid.strip()
     if not uid:
         return uid, "invalid", "empty"
     if uid in maps["valid_ids"]:
-        return uid, "valid", "exact_union_id"
+        if label and not label_matches_union_id(label, uid, maps):
+            return uid, "invalid", "label_mismatch_for_exact_union_id"
+        return uid, "valid", "exact_union_id_label_match" if label else "exact_union_id_no_label_returned"
+
+    source_model_hint = parse_source_model_from_id(uid)
     matches = maps["by_source_id"].get(uid, [])
-    if len(matches) == 1:
-        return matches[0], "repaired", "exact_source_element_id"
+    if len(matches) == 1 and label_matches_union_id(label, matches[0], maps):
+        return matches[0], "repaired", "exact_source_element_id_label_match" if label else "exact_source_element_id_no_label_returned"
+
     if "::" not in uid and ":" in uid:
         source_model, rest = uid.split(":", 1)
         candidates = [(source_model, rest), (source_model, f"{source_model}:{rest}"), (source_model.replace("FHIR", "FHIR_Consent"), rest)]
         for key in candidates:
-            if key in maps["by_pair"]:
-                return maps["by_pair"][key], "repaired", "source_model_pair"
+            if key in maps["by_pair"] and label_matches_union_id(label, maps["by_pair"][key], maps):
+                return maps["by_pair"][key], "repaired", "source_model_pair_label_match" if label else "source_model_pair_no_label_returned"
+
+    # Only allow normalized-id repair when the returned label confirms the same inventory row.
     norm_matches = maps["normalized_index"].get(normalized_id_key(uid), set())
     if len(norm_matches) == 1:
-        return next(iter(norm_matches)), "repaired", "normalized_id_match"
+        candidate = next(iter(norm_matches))
+        if label and label_matches_union_id(label, candidate, maps):
+            return candidate, "repaired", "normalized_id_and_label_match"
+        if not label:
+            return uid, "invalid", "normalized_id_match_requires_label"
     if len(norm_matches) > 1:
         return uid, "invalid", "ambiguous_normalized_id_match"
+
+    # Last safe rescue: malformed ID plus exact returned source_element_label uniquely identifies one inventory row.
+    label_candidate = unique_label_match(label, source_model_hint, maps)
+    if label_candidate:
+        return label_candidate, "repaired", "unique_source_element_label_match"
+
     return uid, "invalid", "no_inventory_match"
 
 
@@ -251,10 +325,18 @@ def validate_forward_obj(forward_obj: dict[str, Any], maps: dict[str, Any]) -> t
             invalid_annotations.append({"raw_annotation": ann, "id_validation_status": "invalid_non_object"})
             continue
         original_uid = ann.get("union_element_id", "")
-        repaired_uid, status, reason = repair_union_id(original_uid, maps)
+        returned_label = returned_source_label(ann)
+        repaired_uid, status, reason = repair_union_id(original_uid, returned_label, maps)
         ann = copy.deepcopy(ann)
+        ann["returned_source_element_label"] = returned_label
         ann["id_validation_status"] = status
         ann["id_validation_reason"] = reason
+        if status in {"valid", "repaired"}:
+            meta = maps["metadata_by_union_id"].get(repaired_uid, {})
+            ann["source_element_label"] = meta.get("label_name", returned_label)
+            ann["source_element_definition"] = meta.get("label_definition", "")
+            ann["source_model"] = meta.get("source_model", "")
+            ann["source_element_id"] = meta.get("source_element_id", "")
         if status == "valid":
             n_valid += 1
             valid_annotations.append(ann)
@@ -319,10 +401,10 @@ def annotation_item(ann: dict[str, Any], source_text: str, maps: dict[str, Any])
         "span_text": span,
         "label_id": uid,
         "label": uid,
-        "label_name": meta.get("label_name", ""),
-        "label_definition": meta.get("label_definition", ""),
-        "source_model": meta.get("source_model", ""),
-        "source_element_id": meta.get("source_element_id", ""),
+        "label_name": meta.get("label_name", norm_text(ann.get("source_element_label"))),
+        "label_definition": meta.get("label_definition", norm_text(ann.get("source_element_definition"))),
+        "source_model": meta.get("source_model", norm_text(ann.get("source_model"))),
+        "source_element_id": meta.get("source_element_id", norm_text(ann.get("source_element_id"))),
         "element_scope": meta.get("element_scope", ""),
         "id_resolution_status": norm_text(ann.get("id_validation_status")),
         "id_resolution_reason": norm_text(ann.get("id_validation_reason")),
@@ -333,6 +415,8 @@ def annotation_item(ann: dict[str, Any], source_text: str, maps: dict[str, Any])
     }
     if norm_text(ann.get("original_union_element_id")):
         item["original_label_id"] = norm_text(ann.get("original_union_element_id"))
+    if norm_text(ann.get("returned_source_element_label")):
+        item["returned_source_element_label"] = norm_text(ann.get("returned_source_element_label"))
     return item
 
 
@@ -492,9 +576,9 @@ def call_chat(client: OpenAI, model_cfg: dict[str, Any], messages: list[dict[str
 
 
 def build_forward_messages(sentence: str, dictionary_text: str) -> list[dict[str, str]]:
-    system = "You are an NLP annotator for informed-consent documents. Your task is to consistently apply the combined source-model data dictionary to the input sentence. Return valid JSON only."
+    system = "You are an NLP annotator for informed-consent documents. Apply only the supplied authoritative dictionary. Return valid JSON only."
     user = f"""
-Task: annotate the informed-consent sentence using ONLY element IDs from the data dictionary below.
+Task: annotate the informed-consent sentence using ONLY rows from the authoritative Union V0 dictionary below.
 
 Important context:
 - This dictionary is a naive union of multiple information models, not a reduced meta-model.
@@ -503,12 +587,17 @@ Important context:
 - A larger phrase may receive a broader role, while a nested shorter phrase may receive a narrower or more specific role.
 - Preserve overlaps/nesting relationships rather than forcing a single label too early.
 
+Hard dictionary rules:
+- Every annotation MUST copy union_element_id exactly from one dictionary row.
+- Every annotation MUST copy source_element_label exactly from the same dictionary row.
+- Do not invent IDs, labels, fields, or namespaces.
+- Do not output unmatched_language as a union_element_id.
+- If no dictionary row fits, put the phrase in unmatched_language instead of creating an annotation.
+- If you are uncertain whether an ID/label pair is valid, do not annotate that phrase.
+
 Annotation rules:
 - Find the smallest meaningful contiguous text span for each concept when possible.
-- Assign one best union_element_id per annotation object.
-- Copy union_element_id EXACTLY from the data dictionary, including punctuation such as "::".
-- Do not create new IDs, abbreviate IDs, or convert double-colon IDs to single-colon IDs.
-- If no exact dictionary ID fits, put the phrase in unmatched_language instead of creating an annotation.
+- Assign one best union_element_id and its exact source_element_label per annotation object.
 - If the same span maps clearly to multiple source-model elements, output multiple annotation objects with the same span_text and a shared overlap_group_id.
 - If a broad phrase and a nested narrower phrase both carry meaning, output both annotations and link them with a shared overlap_group_id.
 - Sentence-level elements may be used only in sentence_level_elements, not as span annotations.
@@ -524,12 +613,13 @@ Data dictionary:
 Return JSON with exactly this structure:
 {{
   "sentence_decision": "permit|deny|mixed|unclear",
-  "sentence_level_elements": [{{"union_element_id": "...", "value": "..."}}],
+  "sentence_level_elements": [{{"union_element_id": "...", "source_element_label": "exact dictionary label", "value": "..."}}],
   "annotations": [
     {{
       "annotation_id": "a1",
       "span_text": "exact text span",
-      "union_element_id": "...",
+      "union_element_id": "exact dictionary union_element_id",
+      "source_element_label": "exact dictionary source_element_label",
       "overlap_group_id": "g1 or null",
       "span_relation": "single|same_span|broader_span|narrower_nested_span|partially_overlapping_span",
       "rationale": "brief rationale"
@@ -642,6 +732,36 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
     pd.DataFrame(rows).to_csv(out_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 
 
+def write_invalid_id_audit(forward_path: Path, audit_csv: Path) -> None:
+    rows = []
+    forward = load_jsonl_by_id(forward_path)
+    for source_id, fwd in forward.items():
+        parsed = fwd.get("parsed_forward") or {}
+        for group, status_group in [(parsed.get("annotations") or [], "valid_or_repaired"), (parsed.get("invalid_annotations") or [], "invalid")]:
+            if not isinstance(group, list):
+                continue
+            for ann in group:
+                if not isinstance(ann, dict):
+                    continue
+                status = norm_text(ann.get("id_validation_status"))
+                if status_group == "valid_or_repaired" and status != "repaired":
+                    continue
+                rows.append({
+                    "source_id": source_id,
+                    "source_text": fwd.get("source_text", ""),
+                    "annotation_id": norm_text(ann.get("annotation_id")),
+                    "span_text": norm_text(ann.get("span_text")),
+                    "status": status,
+                    "reason": norm_text(ann.get("id_validation_reason")),
+                    "original_union_element_id": norm_text(ann.get("original_union_element_id") or ann.get("invalid_union_element_id") or ann.get("union_element_id")),
+                    "resolved_union_element_id": norm_text(ann.get("union_element_id")) if status == "repaired" else "",
+                    "returned_source_element_label": norm_text(ann.get("returned_source_element_label")),
+                    "resolved_source_element_label": norm_text(ann.get("source_element_label")),
+                    "rationale_audit_only": norm_text(ann.get("rationale")),
+                })
+    pd.DataFrame(rows).to_csv(audit_csv, index=False)
+
+
 def run_forward(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], dictionary_text: str, maps: dict[str, Any], out_dir: Path) -> None:
     forward_path = out_dir / "union_v0_forward_mappings.jsonl"
     failures_path = out_dir / "failed_requests.jsonl"
@@ -721,8 +841,8 @@ def main() -> None:
         "n_union_elements": int(len(inv)),
         "inventory_csv": args.inventory_csv,
         "roundtrips_csv": args.roundtrips_csv,
-        "prompt_design": "overlap_aware_forward_with_audit_fields",
-        "id_validation": "exact_alias_normalized_repair_then_flag_unresolved",
+        "prompt_design": "overlap_aware_forward_requires_verbatim_id_and_label",
+        "id_validation": "exact_id_plus_label_validation_with_safe_format_repairs",
         "backward_input": STRICT_POLICY,
         "backward_prompt": "universal_annotation_dictionary_relationships",
     }
@@ -734,6 +854,7 @@ def main() -> None:
         run_backward(client, model_cfg, dictionary_text, maps, output_dir)
 
     write_roundtrip_csv(output_dir / "union_v0_forward_mappings.jsonl", output_dir / "union_v0_backward_reconstructions.jsonl", output_dir / "union_v0_roundtrip_outputs.csv")
+    write_invalid_id_audit(output_dir / "union_v0_forward_mappings.jsonl", output_dir / "invalid_id_audit.csv")
     print(f"Wrote outputs under {output_dir}")
 
 
