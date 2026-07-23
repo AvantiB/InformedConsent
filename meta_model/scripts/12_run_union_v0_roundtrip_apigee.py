@@ -65,8 +65,9 @@ def main() -> None:
         "n_union_elements": int(len(inv)),
         "inventory_csv": args.inventory_csv,
         "roundtrips_csv": args.roundtrips_csv,
-        "prompt_design": "overlap_aware_forward_with_audit_fields",
-        "id_validation": "exact_alias_normalized_repair_then_flag_unresolved",
+        "prompt_design": "overlap_aware_forward_requires_verbatim_id_label_and_controlled_sentence_decisions",
+        "id_validation": "exact_id_plus_label_validation_with_reserved_non_label_routing",
+        "sentence_level_backward_policy": "controlled_decision_values_only_no_explanatory_summaries",
         "backward_input": mod.STRICT_POLICY,
         "backward_prompt": "universal_annotation_dictionary_relationships",
         "chat_transport": "mayo_apigee_azure_openai",
@@ -80,6 +81,7 @@ def main() -> None:
         mod.run_backward(client, model_cfg, dictionary_text, maps, output_dir)
 
     mod.write_roundtrip_csv(output_dir / "union_v0_forward_mappings.jsonl", output_dir / "union_v0_backward_reconstructions.jsonl", output_dir / "union_v0_roundtrip_outputs.csv")
+    mod.write_invalid_id_audit(output_dir / "union_v0_forward_mappings.jsonl", output_dir / "invalid_id_audit.csv")
     print(f"Wrote outputs under {output_dir}")
 
 
