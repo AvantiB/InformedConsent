@@ -73,6 +73,9 @@ def main() -> None:
         "inventory_csv": args.inventory_csv,
         "backward_prompt_dir_deprecated_not_used": args.backward_prompt_dir,
         "stage": args.stage,
+        "prompt_design": "source_model_forward_requires_verbatim_id_label_and_controlled_sentence_decisions",
+        "id_validation": "source_model_inventory_label_validation_with_reserved_non_label_routing",
+        "sentence_level_backward_policy": "controlled_decision_values_only_no_explanatory_summaries",
         "backward_input": mod.STRICT_POLICY,
         "backward_prompt": "universal_annotation_dictionary_relationships",
         "chat_transport": "mayo_apigee_azure_openai",
@@ -91,6 +94,7 @@ def main() -> None:
             "backward_prompt_file_deprecated_not_used": str(backward_path) if backward_path else None,
             "uses_universal_structured_backward_prompt": True,
             "backward_input_policy": mod.STRICT_POLICY,
+            "strict_forward_contract_applied": True,
         }, indent=2))
         mod.run_info_model(rows, client, model_cfg, info_model, prompt_text, backward_text, out_dir, args.stage, label_lookup)
 
