@@ -1,12 +1,17 @@
 #!/usr/bin/env python
 """Run individual source-model prompt round-trip experiments.
 
-Forward uses the original source-model forward prompt text and can be reused from
-previous runs. Backward evaluation uses the same universal structured protocol as
-Union V0: parsed span annotations enriched with static label metadata when
-available, sanitized relationship links, and eligible sentence-level annotations.
-Rows with no backward-eligible annotations are not sent to the LLM; their
-reconstruction is intentionally blank.
+Forward uses each original source-model prompt as the information-model specific
+schema, but adds a strict Phase 1 output contract around it: annotation labels
+should be copied verbatim from the source-model dictionary, reserved non-label
+strings are not valid annotation IDs, and sentence-level values must be
+controlled consent-force labels only.
+
+Backward evaluation uses the same universal structured protocol as Union V0:
+valid span annotations enriched with static label metadata, sanitized
+relationship links, and controlled sentence-level decision labels. Rows with no
+backward-eligible annotations are not sent to the LLM; their reconstruction is
+intentionally blank.
 """
 from __future__ import annotations
 
@@ -38,10 +43,27 @@ TEXT_COL_CANDIDATES = ["canonical_full_text", "full_text_original", "original_se
 ID_COL_CANDIDATES = ["sentence_id", "source_sentence_id", "roundtrip_id", "id"]
 INFO_MODELS = ["DUO", "ICO", "ODRL", "FHIR_Consent"]
 PROMPT_PATTERNS = {"DUO": [r"duo"], "ICO": [r"ico"], "ODRL": [r"odrl"], "FHIR_Consent": [r"fhir", r"r03_fhir"]}
-SPAN_KEYS = ["span_text", "evidence_span_text", "evidence_text", "text_span", "phrase", "text", "span", "value", "verbatim"]
-LABEL_KEYS = ["field_name", "field_id", "label", "element", "element_id", "source_element_id", "union_element_id", "node", "term", "class", "category", "path", "role", "type", "id"]
-DECISION_KEYS = ["decision", "polarity", "consent_force", "permission", "rule_type", "value"]
-DECISION_VALUES = {"permit", "deny", "denied", "prohibit", "prohibition", "permission", "obligation", "mixed", "unclear", "allow", "allowed"}
+SPAN_KEYS = ["span_text", "evidence_span_text", "evidence_text", "text_span", "phrase", "text", "span", "verbatim"]
+LABEL_KEYS = [
+    "source_element_id",
+    "source_element_label",
+    "field_name",
+    "field_id",
+    "label",
+    "element",
+    "element_id",
+    "union_element_id",
+    "node",
+    "term",
+    "class",
+    "category",
+    "path",
+    "role",
+    "type",
+    "id",
+]
+DECISION_KEYS = ["sentence_decision", "decision", "polarity", "consent_force", "permission", "rule_type", "value"]
+RESERVED_NON_LABEL_IDS = {"", "unmatched_language", "unmatched", "no_match", "no match", "none", "null", "unknown", "invalid", "n/a", "na"}
 STRICT_POLICY = "annotation_dictionary_relationships"
 NO_ANNOTATION_NOTE = "Annotation evidence was empty or insufficient."
 RELATIONSHIP_TYPES = {
@@ -53,6 +75,13 @@ RELATIONSHIP_TYPES = {
     "single",
     "conflicting_or_uncertain",
     "unknown",
+}
+SENTENCE_LEVEL_DECISION_LABELS = {
+    "Rule_TestSentence",
+    "Consent.provision.type",
+    "Consent.decision",
+    "DUO.decision",
+    "ICO.decision",
 }
 
 UNIVERSAL_BACKWARD_SYSTEM = (
@@ -67,6 +96,7 @@ Instructions:
 - Use label_name and label_definition to interpret annotation labels.
 - Use relationship_links only as structural cues for how listed annotations relate to each other.
 - Relationship links do not add source wording beyond the annotation spans and static label metadata.
+- Use sentence_level_annotations only as controlled consent-force cues attached to the listed span evidence.
 - Preserve the order indicated by sentence_order_index when available.
 - You may add minimal grammar/function words needed to make the reconstruction readable, but do not add unsupported content.
 - If the annotation evidence is empty or insufficient, return an empty reconstructed_sentence and explain that annotation evidence was insufficient.
@@ -100,12 +130,8 @@ def norm_text(x: Any) -> str:
     return " ".join(str(x).split())
 
 
-def stable_id(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
-
-
-def normalized_key(x: Any) -> str:
-    raw = norm_text(x).lower()
+def norm_key(x: Any) -> str:
+    raw = norm_text(x).casefold()
     parts = re.split(r"[^a-z0-9]+", raw)
     out = []
     for part in parts:
@@ -113,6 +139,14 @@ def normalized_key(x: Any) -> str:
             continue
         out.append(str(int(part)) if part.isdigit() else part)
     return "|".join(out)
+
+
+def is_reserved_non_label_id(x: Any) -> bool:
+    return norm_text(x).casefold() in RESERVED_NON_LABEL_IDS
+
+
+def stable_id(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
 def pick_col(df: pd.DataFrame, candidates: list[str], required: bool = True) -> str | None:
@@ -142,8 +176,8 @@ def load_rows(roundtrips_csv: Path, limit: int | None, no_dedupe_sentences: bool
     return out[["_source_id", "_source_text"]]
 
 
-def load_label_lookup(inventory_csv: Path | None) -> dict[str, dict[str, Any]]:
-    lookup: dict[str, dict[str, Any]] = {}
+def load_label_lookup(inventory_csv: Path | None) -> dict[str, Any]:
+    lookup: dict[str, Any] = {"by_info_key": {}, "by_info_label": {}, "metadata_by_union_id": {}}
     if inventory_csv is None or not inventory_csv.exists():
         return lookup
     inv = pd.read_csv(inventory_csv).fillna("")
@@ -152,42 +186,53 @@ def load_label_lookup(inventory_csv: Path | None) -> dict[str, dict[str, Any]]:
         return lookup
     for _, row in inv.iterrows():
         source_model = norm_text(row["source_model"])
-        aliases = {source_model, source_model.replace("_Consent", ""), source_model.replace("_", "")}
+        union_id = norm_text(row["union_element_id"])
+        source_id = norm_text(row["source_element_id"])
+        label = norm_text(row["source_element_label"])
+        definition = norm_text(row["source_element_definition"])
         meta = {
-            "union_label_id": norm_text(row["union_element_id"]),
+            "union_label_id": union_id,
             "source_model": source_model,
-            "source_element_id": norm_text(row["source_element_id"]),
-            "label_name": norm_text(row["source_element_label"]),
-            "label_definition": norm_text(row["source_element_definition"]),
+            "source_element_id": source_id,
+            "label_name": label,
+            "label_definition": definition,
         }
-        candidates = [row["union_element_id"], row["source_element_id"], row["source_element_label"]]
+        lookup["metadata_by_union_id"][union_id] = meta
+        aliases = {source_model, source_model.replace("_Consent", ""), source_model.replace("_", "")}
+        candidates = {union_id, source_id, label}
         for alias in aliases:
+            alias_key = alias.casefold()
             for cand in candidates:
-                lookup[f"{alias}::{normalized_key(cand)}"] = meta
-                lookup[f"{alias}:{normalized_key(cand)}"] = meta
-        for cand in candidates:
-            lookup[normalized_key(cand)] = meta
+                lookup["by_info_key"][(alias_key, norm_key(cand))] = meta
+            lookup["by_info_label"].setdefault((alias_key, norm_key(label)), []).append(meta)
     return lookup
 
 
-def resolve_label_metadata(label: str, info_model: str, lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    keys = [
-        f"{info_model}::{normalized_key(label)}",
-        f"{info_model}:{normalized_key(label)}",
-        f"{info_model.replace('_Consent', '')}::{normalized_key(label)}",
-        f"{info_model.replace('_', '')}::{normalized_key(label)}",
-        normalized_key(label),
-    ]
-    meta = next((lookup[k] for k in keys if k in lookup), {})
-    return {
-        "label_id": label,
-        "label": label,
-        "union_label_id": meta.get("union_label_id", ""),
-        "label_name": meta.get("label_name", label),
-        "label_definition": meta.get("label_definition", ""),
-        "source_model": meta.get("source_model", info_model),
-        "source_element_id": meta.get("source_element_id", label),
-    }
+def info_model_aliases(info_model: str) -> list[str]:
+    return [info_model, info_model.replace("_Consent", ""), info_model.replace("_", "")]
+
+
+def resolve_label_metadata(label: str, info_model: str, lookup: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
+    label = norm_text(label)
+    if not label:
+        return {}, "invalid", "empty_label"
+    if is_reserved_non_label_id(label):
+        return {}, "routed_to_unmatched", "reserved_non_label_id"
+    keys = [(alias.casefold(), norm_key(label)) for alias in info_model_aliases(info_model)]
+    for key in keys:
+        meta = lookup.get("by_info_key", {}).get(key)
+        if meta:
+            return meta, "valid", "exact_inventory_match"
+    # Last safe rescue: exact label text uniquely identifies one row within this source model.
+    candidates: list[dict[str, Any]] = []
+    for alias in info_model_aliases(info_model):
+        candidates.extend(lookup.get("by_info_label", {}).get((alias.casefold(), norm_key(label)), []))
+    unique = {m.get("union_label_id", ""): m for m in candidates if m.get("union_label_id")}
+    if len(unique) == 1:
+        return next(iter(unique.values())), "repaired", "unique_source_element_label_match"
+    if len(unique) > 1:
+        return {}, "invalid", "ambiguous_label_match"
+    return {}, "invalid", "no_inventory_match"
 
 
 def load_model_config(path: Path, model_key: str) -> dict[str, Any]:
@@ -249,9 +294,54 @@ def find_backward_prompt_file(backward_dir: Path | None, info_model: str) -> Pat
 
 
 def build_forward_messages(prompt_text: str, sentence: str) -> list[dict[str, str]]:
-    system = "You are an NLP annotator for informed-consent documents. Return only the requested output format."
+    system = "You are an NLP annotator for informed-consent documents. Apply only the supplied source-model dictionary. Return valid JSON only."
     user = f"""
-Use the following original source-model prompt to annotate the sentence.
+Use the original source-model prompt below as the information-model schema, but follow the strict Phase 1 output contract.
+
+Strict Phase 1 output contract:
+- Return JSON only.
+- Every span annotation must copy a source-model element ID or label exactly from the source-model prompt/dictionary.
+- When available, include both source_element_id and source_element_label copied verbatim from the same source-model row.
+- Do not invent IDs, labels, fields, or namespaces.
+- Never use reserved non-label strings as annotation IDs or labels: unmatched_language, unmatched, no_match, none, null, unknown, invalid, n/a.
+- unmatched_language is only the name of the top-level audit list. It is never a valid annotation label.
+- If no source-model dictionary row fits, place the phrase only in top-level unmatched_language and do not create an annotation object for it.
+- A phrase may be annotated with a general source-model class even when the phrase is a named instance and the exact phrase is not in the dictionary.
+- Do not annotate standalone “yes” or “no” as Permission or Prohibition unless it directly governs a specific action. Phrases like “say yes or no” represent choice/decision, not permit plus prohibit.
+- Phrases like “no penalty” and “no expiration date” are not sentence-level denial/prohibition; they are consequence/protection or temporal-scope expressions.
+- sentence_decision must be one of: permit, deny, mixed, unclear.
+- sentence_level_elements.value must be a controlled decision value only, e.g., permit, deny, mixed, unclear, Permission, Prohibition, Duty. Do not write explanatory summaries in sentence_level_elements.value.
+
+Return JSON with this structure when possible:
+{{
+  "sentence_decision": "permit|deny|mixed|unclear",
+  "sentence_level_elements": [{{"source_element_id": "exact source ID", "source_element_label": "exact source label", "value": "controlled decision value only"}}],
+  "annotations": [
+    {{
+      "annotation_id": "a1",
+      "span_text": "exact text span",
+      "source_element_id": "exact source-model element ID if available",
+      "source_element_label": "exact source-model element label if available",
+      "label": "same as source_element_label if no separate field is required",
+      "overlap_group_id": "g1 or null",
+      "span_relation": "single|same_span|broader_span|narrower_nested_span|partially_overlapping_span",
+      "decision_or_polarity": "controlled local value if explicitly supported, else empty",
+      "rationale": "brief audit-only rationale"
+    }}
+  ],
+  "interpretation_units": [
+    {{
+      "unit_id": "u1",
+      "evidence_span_text": "span or phrase represented by this unit",
+      "annotation_ids": ["a1", "a2"],
+      "relationship": "single|same_span_multiple_labels|nested_broad_narrow|complementary_roles|conflicting_or_uncertain",
+      "combined_meaning": "audit only",
+      "backward_mapping_decision": "audit only",
+      "rationale": "brief explanation of how the annotations should be considered together"
+    }}
+  ],
+  "unmatched_language": [{{"span_text": "exact text span", "reason": "brief reason"}}]
+}}
 
 Original source-model prompt:
 {prompt_text}
@@ -342,6 +432,7 @@ def get_span_value(d: dict[str, Any]) -> str:
 
 
 def get_label_value(d: dict[str, Any], span: str = "") -> str:
+    # Prefer explicit source ID, then explicit source label, then legacy label-like fields.
     for key in LABEL_KEYS:
         value = norm_text(d.get(key))
         if value and value != span and key not in SPAN_KEYS:
@@ -349,11 +440,38 @@ def get_label_value(d: dict[str, Any], span: str = "") -> str:
     return ""
 
 
+def get_label_name_value(d: dict[str, Any]) -> str:
+    return first_value(d, ["source_element_label", "label_name", "label", "field_name", "element", "term", "class", "category", "role", "type"])
+
+
 def get_decision_value(d: dict[str, Any]) -> str:
     for key in DECISION_KEYS:
-        value = norm_text(d.get(key))
-        if value and value.lower() in DECISION_VALUES:
+        value = normalize_sentence_decision_value(d.get(key))
+        if value:
             return value
+    return ""
+
+
+def normalize_sentence_decision_value(value: Any) -> str:
+    raw = norm_text(value)
+    low = raw.casefold()
+    if not low:
+        return ""
+    if len(raw) > 40 or len(raw.split()) > 4:
+        return ""
+    permit = {"permit", "permission", "permitted", "allow", "allowed", "yes", "consent", "authorized", "authorization"}
+    deny = {"deny", "denial", "prohibition", "prohibit", "prohibited", "forbid", "forbidden", "no", "refuse", "refusal"}
+    obligation = {"duty", "obligation", "obligated", "mandatory", "required", "must"}
+    if low in permit:
+        return "permit"
+    if low in deny:
+        return "deny"
+    if low in obligation:
+        return "obligation"
+    if low in {"mixed", "both"}:
+        return "mixed"
+    if low in {"unclear", "unknown", "not clear", "ambiguous"}:
+        return "unclear"
     return ""
 
 
@@ -365,6 +483,7 @@ def annotation_from_dict(d: dict[str, Any]) -> dict[str, str] | None:
             "annotation_id": first_value(d, ["annotation_id", "id"]),
             "span_text": span,
             "label": label,
+            "returned_source_element_label": get_label_name_value(d),
             "decision_or_polarity": get_decision_value(d),
             "span_relation": first_value(d, ["span_relation", "relationship"]),
             "overlap_group_id": first_value(d, ["overlap_group_id", "group_id"]),
@@ -398,9 +517,9 @@ def is_probable_label_or_decision(value: str) -> bool:
     v = norm_text(value).lower()
     if not v:
         return True
-    if v in {"full_text", "sentence", "text"} | DECISION_VALUES:
+    if v in {"full_text", "sentence", "text"} or normalize_sentence_decision_value(v):
         return True
-    if re.fullmatch(r"[A-Za-z_:-]{1,12}", value) and " " not in value:
+    if re.fullmatch(r"[A-Za-z_:-]{1,20}", value) and " " not in value:
         return True
     return False
 
@@ -428,9 +547,9 @@ def compact_annotations(text: str) -> list[dict[str, str]]:
     for m in pattern.finditer(text):
         span = norm_text(m.group("span")).strip(" ;,.-")
         label = norm_text(m.group("label"))
-        decision = norm_text(m.group("decision"))
+        decision = normalize_sentence_decision_value(m.group("decision"))
         if span and label:
-            out.append({"annotation_id": "", "span_text": span, "label": label, "decision_or_polarity": decision, "span_relation": "", "overlap_group_id": "", "parse_source": "compact_bracket"})
+            out.append({"annotation_id": "", "span_text": span, "label": label, "returned_source_element_label": label, "decision_or_polarity": decision, "span_relation": "", "overlap_group_id": "", "parse_source": "compact_bracket"})
     return out
 
 
@@ -443,19 +562,38 @@ def csv_annotations(text: str, source_text: str) -> list[dict[str, str]]:
             continue
         labels = [c for c in row if c and c != span and not is_full_sentence_like(c, source_text)]
         labels = [c for c in labels if c.lower() not in {"span", "text", "sentence", "full_text"}]
-        label = next((c for c in labels if c.lower() not in DECISION_VALUES), "")
-        decision = next((c for c in labels if c.lower() in DECISION_VALUES), "")
+        label = next((c for c in labels if not normalize_sentence_decision_value(c)), "")
+        decision = next((normalize_sentence_decision_value(c) for c in labels if normalize_sentence_decision_value(c)), "")
         if label:
-            out.append({"annotation_id": "", "span_text": span, "label": label, "decision_or_polarity": decision, "span_relation": "", "overlap_group_id": "", "parse_source": "csv_like"})
+            out.append({"annotation_id": "", "span_text": span, "label": label, "returned_source_element_label": label, "decision_or_polarity": decision, "span_relation": "", "overlap_group_id": "", "parse_source": "csv_like"})
     return out
 
 
-def parse_span_annotations(raw_forward: str, source_text: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
+def ensure_unmatched_language_list(parsed: Any) -> list[dict[str, str]]:
+    if not isinstance(parsed, dict):
+        return []
+    existing = parsed.get("unmatched_language")
+    if not isinstance(existing, list):
+        return []
+    out = []
+    for item in existing:
+        if isinstance(item, dict):
+            span = norm_text(item.get("span_text"))
+            reason = norm_text(item.get("reason"))
+            if span or reason:
+                out.append({"span_text": span, "reason": reason})
+        elif norm_text(item):
+            out.append({"span_text": norm_text(item), "reason": "raw_unmatched_language_string"})
+    return out
+
+
+def parse_span_annotations(raw_forward: str, source_text: str, info_model: str, label_lookup: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]]]:
+    parsed_obj: Any = None
     annotations: list[dict[str, str]] = []
     parse_mode = ""
     try:
-        parsed = extract_json(raw_forward)
-        annotations = collect_json_annotations(parsed)
+        parsed_obj = extract_json(raw_forward)
+        annotations = collect_json_annotations(parsed_obj)
         parse_mode = "json_like"
     except Exception:
         pass
@@ -465,8 +603,11 @@ def parse_span_annotations(raw_forward: str, source_text: str) -> tuple[list[dic
     if not annotations:
         annotations = csv_annotations(raw_forward, source_text)
         parse_mode = "csv_like" if annotations else parse_mode
+
+    valid: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
+    routed: list[dict[str, Any]] = []
     seen = set()
-    kept = []
     dropped_full_sentence = 0
     for ann in annotations:
         span = norm_text(ann.get("span_text"))
@@ -476,39 +617,109 @@ def parse_span_annotations(raw_forward: str, source_text: str) -> tuple[list[dic
         if is_full_sentence_like(span, source_text):
             dropped_full_sentence += 1
             continue
-        key = (span.lower(), label.lower(), norm_text(ann.get("decision_or_polarity")).lower())
+        meta, status, reason = resolve_label_metadata(label, info_model, label_lookup)
+        clean = dict(ann)
+        clean["annotation_id"] = norm_text(clean.get("annotation_id")) or f"a{len(valid) + len(invalid) + len(routed) + 1}"
+        clean["id_validation_status"] = status
+        clean["id_validation_reason"] = reason
+        if status == "routed_to_unmatched":
+            clean["invalid_label"] = label
+            routed.append(clean)
+            continue
+        if status not in {"valid", "repaired"}:
+            clean["invalid_label"] = label
+            invalid.append(clean)
+            continue
+        key = (span.lower(), meta.get("union_label_id", label).lower(), norm_text(clean.get("decision_or_polarity")).lower())
         if key in seen:
             continue
         seen.add(key)
-        ann = dict(ann)
-        ann["annotation_id"] = norm_text(ann.get("annotation_id")) or f"a{len(kept) + 1}"
-        kept.append(ann)
-    audit = {"annotation_parse_mode": parse_mode or "none", "n_annotations_parsed": len(annotations), "n_annotations_backward_eligible_strict": len(kept), "n_full_sentence_spans_dropped": dropped_full_sentence}
-    return kept, audit
+        clean.update({
+            "label_id": meta.get("source_element_id", label),
+            "label": meta.get("source_element_id", label),
+            "union_label_id": meta.get("union_label_id", ""),
+            "label_name": meta.get("label_name", label),
+            "label_definition": meta.get("label_definition", ""),
+            "source_model": meta.get("source_model", info_model),
+            "source_element_id": meta.get("source_element_id", label),
+        })
+        valid.append(clean)
+
+    unmatched = ensure_unmatched_language_list(parsed_obj)
+    for ann in routed:
+        span = norm_text(ann.get("span_text"))
+        if span:
+            unmatched.append({"span_text": span, "reason": "LLM placed reserved non-label value inside annotations; routed to unmatched_language audit."})
+    audit = {
+        "annotation_parse_mode": parse_mode or "none",
+        "n_annotations_parsed": len(annotations),
+        "n_annotations_valid": len(valid),
+        "n_annotations_invalid": len(invalid),
+        "n_annotations_routed_to_unmatched": len(routed),
+        "n_annotations_backward_eligible_strict": len(valid),
+        "n_full_sentence_spans_dropped": dropped_full_sentence,
+    }
+    return valid, audit, invalid, routed, unmatched
 
 
-def extract_sentence_level_annotations(raw_forward: str, has_valid_span_annotations: bool) -> list[dict[str, str]]:
+def canonical_sentence_level_element(item: dict[str, Any], info_model: str, lookup: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    label = first_value(item, ["source_element_id", "source_element_label", "union_element_id", "field", "field_name", "label", "id"])
+    value = first_value(item, ["value", "decision", "rule_type", "permission", "prohibition"])
+    canonical_value = normalize_sentence_decision_value(value)
+    if not canonical_value:
+        return None, "non_controlled_or_explanatory_value"
+    if not label:
+        return {"field": "sentence_level_decision", "value": canonical_value, "support": "valid_span_annotations_present"}, "included_without_label"
+    meta, status, reason = resolve_label_metadata(label, info_model, lookup)
+    if status not in {"valid", "repaired"}:
+        return None, f"invalid_sentence_level_label:{reason}"
+    label_name = meta.get("label_name", label)
+    if label_name not in SENTENCE_LEVEL_DECISION_LABELS and meta.get("source_element_id") not in SENTENCE_LEVEL_DECISION_LABELS:
+        return None, "not_approved_sentence_decision_field"
+    return {
+        "field": "sentence_level_decision",
+        "label_id": meta.get("source_element_id", label),
+        "union_label_id": meta.get("union_label_id", ""),
+        "label_name": label_name,
+        "label_definition": meta.get("label_definition", ""),
+        "source_model": meta.get("source_model", info_model),
+        "source_element_id": meta.get("source_element_id", label),
+        "value": canonical_value,
+        "support": "valid_span_annotations_present",
+        "id_resolution_status": status,
+        "id_resolution_reason": reason,
+    }, "included"
+
+
+def extract_sentence_level_annotations(raw_forward: str, has_valid_span_annotations: bool, info_model: str, label_lookup: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, int]]:
     if not has_valid_span_annotations:
-        return []
-    out: list[dict[str, str]] = []
+        return [], {"n_sentence_level_annotations_backward_eligible": 0, "n_sentence_level_elements_dropped_by_policy": 0}
+    out: list[dict[str, Any]] = []
+    dropped = 0
     try:
         parsed = extract_json(raw_forward)
     except Exception:
         parsed = None
     if isinstance(parsed, dict):
-        for key in ["sentence_decision", "decision", "rule_type", "permission", "prohibition"]:
-            val = norm_text(parsed.get(key))
-            if val:
-                out.append({"field": key, "value": val, "support": "valid_span_annotations_present"})
+        canonical = normalize_sentence_decision_value(parsed.get("sentence_decision") or parsed.get("decision"))
+        if canonical:
+            out.append({"field": "sentence_decision", "value": canonical, "support": "valid_span_annotations_present"})
+        for key in ["rule_type", "permission", "prohibition"]:
+            canonical = normalize_sentence_decision_value(parsed.get(key))
+            if canonical:
+                out.append({"field": key, "value": canonical, "support": "valid_span_annotations_present"})
         elems = parsed.get("sentence_level_elements") or []
         if isinstance(elems, list):
             for item in elems:
-                if isinstance(item, dict):
-                    d = {k: norm_text(v) for k, v in item.items() if norm_text(v)}
-                    if d:
-                        d["support"] = "valid_span_annotations_present"
-                        out.append(d)
-    return out
+                if not isinstance(item, dict):
+                    dropped += 1
+                    continue
+                canonical_elem, _reason = canonical_sentence_level_element(item, info_model, label_lookup)
+                if canonical_elem is None:
+                    dropped += 1
+                else:
+                    out.append(canonical_elem)
+    return out, {"n_sentence_level_annotations_backward_eligible": len(out), "n_sentence_level_elements_dropped_by_policy": dropped}
 
 
 def normalize_relationship_type(x: Any) -> str:
@@ -558,17 +769,23 @@ def extract_relationship_links(raw_forward: str, valid_annotation_ids: set[str])
     return links
 
 
-def build_sanitized_forward_material(raw_forward: str, source_text: str, info_model: str, label_lookup: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
-    annotations, audit = parse_span_annotations(raw_forward, source_text)
+def build_sanitized_forward_material(raw_forward: str, source_text: str, info_model: str, label_lookup: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    annotations, audit, invalid_annotations, routed_unmatched, unmatched = parse_span_annotations(raw_forward, source_text, info_model, label_lookup)
     ordered = []
     for ann in annotations:
         start, end = find_span_bounds(source_text, ann.get("span_text", ""))
-        label = norm_text(ann.get("label", ""))
-        meta = resolve_label_metadata(label, info_model, label_lookup)
         ordered.append({
             "annotation_id": ann.get("annotation_id", ""),
             "span_text": ann.get("span_text", ""),
-            **meta,
+            "label_id": ann.get("label_id", ann.get("label", "")),
+            "label": ann.get("label", ""),
+            "union_label_id": ann.get("union_label_id", ""),
+            "label_name": ann.get("label_name", ann.get("label", "")),
+            "label_definition": ann.get("label_definition", ""),
+            "source_model": ann.get("source_model", info_model),
+            "source_element_id": ann.get("source_element_id", ann.get("label", "")),
+            "id_resolution_status": ann.get("id_validation_status", ""),
+            "id_resolution_reason": ann.get("id_validation_reason", ""),
             "decision_or_polarity": ann.get("decision_or_polarity", ""),
             "span_relation": ann.get("span_relation", ""),
             "overlap_group_id": ann.get("overlap_group_id", ""),
@@ -579,18 +796,26 @@ def build_sanitized_forward_material(raw_forward: str, source_text: str, info_mo
     for i, item in enumerate(ordered, start=1):
         item["sentence_order_index"] = i
     valid_annotation_ids = {norm_text(x.get("annotation_id")) for x in ordered if norm_text(x.get("annotation_id"))}
+    sent_level, sent_audit = extract_sentence_level_annotations(raw_forward, bool(ordered), info_model, label_lookup)
     packet = {
         "backward_input_policy": STRICT_POLICY,
         "ordered_reconstruction_items": ordered,
         "relationship_links": extract_relationship_links(raw_forward, valid_annotation_ids),
-        "sentence_level_annotations": extract_sentence_level_annotations(raw_forward, bool(ordered)),
+        "sentence_level_annotations": sent_level,
     }
     audit = {
         **audit,
+        **sent_audit,
         "n_relationship_links_backward_eligible": len(packet["relationship_links"]),
-        "n_sentence_level_annotations_backward_eligible": len(packet["sentence_level_annotations"]),
+        "n_invalid_annotations": len(invalid_annotations),
+        "n_routed_unmatched_annotations": len(routed_unmatched),
     }
-    return packet, audit
+    audit_material = {
+        "invalid_annotations": invalid_annotations,
+        "routed_unmatched_annotations": routed_unmatched,
+        "unmatched_language": unmatched,
+    }
+    return packet, {**audit, **audit_material}
 
 
 def build_backward_messages(sanitized_material: dict[str, Any]) -> list[dict[str, str]]:
@@ -645,6 +870,32 @@ def parse_backward_response(raw: str) -> dict[str, str]:
     return {"reconstructed_sentence": norm_text(raw), "reconstruction_notes": "non_json_backward_response"}
 
 
+def write_label_audit(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
+    fwd = load_jsonl_by_id(forward_path)
+    bwd = load_jsonl_by_id(backward_path)
+    rows = []
+    for source_id, f in fwd.items():
+        b = bwd.get(source_id, {})
+        audit = b.get("backward_annotation_audit", {})
+        for group_name in ["invalid_annotations", "routed_unmatched_annotations"]:
+            for ann in audit.get(group_name, []) if isinstance(audit.get(group_name), list) else []:
+                if not isinstance(ann, dict):
+                    continue
+                rows.append({
+                    "source_id": source_id,
+                    "source_text": f.get("source_text", ""),
+                    "info_model": f.get("info_model", ""),
+                    "group": group_name,
+                    "annotation_id": norm_text(ann.get("annotation_id")),
+                    "span_text": norm_text(ann.get("span_text")),
+                    "label": norm_text(ann.get("label")),
+                    "status": norm_text(ann.get("id_validation_status")),
+                    "reason": norm_text(ann.get("id_validation_reason")),
+                    "rationale_audit_only": norm_text(ann.get("rationale")),
+                })
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+
 def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
     fwd = load_jsonl_by_id(forward_path)
     bwd = load_jsonl_by_id(backward_path)
@@ -666,10 +917,18 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
             "backward_input_policy": packet.get("backward_input_policy", STRICT_POLICY),
             "sanitized_forward_material_json": json.dumps(packet, ensure_ascii=False),
             "backward_annotation_audit_json": json.dumps(audit, ensure_ascii=False),
+            "invalid_annotations_json": json.dumps(audit.get("invalid_annotations", []), ensure_ascii=False),
+            "routed_unmatched_annotations_json": json.dumps(audit.get("routed_unmatched_annotations", []), ensure_ascii=False),
+            "unmatched_language_json": json.dumps(audit.get("unmatched_language", []), ensure_ascii=False),
             "annotation_count": len(items),
             "unique_element_count": len({norm_text(x.get("label_id") or x.get("label")) for x in items if isinstance(x, dict) and norm_text(x.get("label_id") or x.get("label"))}),
             "n_annotations_backward_eligible": len(items),
+            "n_annotations_valid": audit.get("n_annotations_valid", ""),
+            "n_annotations_invalid": audit.get("n_annotations_invalid", ""),
+            "n_annotations_routed_to_unmatched": audit.get("n_annotations_routed_to_unmatched", ""),
             "n_relationship_links_backward_eligible": audit.get("n_relationship_links_backward_eligible", ""),
+            "n_sentence_level_annotations_backward_eligible": audit.get("n_sentence_level_annotations_backward_eligible", ""),
+            "n_sentence_level_elements_dropped_by_policy": audit.get("n_sentence_level_elements_dropped_by_policy", ""),
             "n_full_sentence_spans_dropped": audit.get("n_full_sentence_spans_dropped", ""),
             "annotation_parse_mode": audit.get("annotation_parse_mode", ""),
             "forward_parse_ok": bool(items) or bool(f.get("raw_response", "")),
@@ -680,7 +939,7 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
     pd.DataFrame(rows).to_csv(out_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 
 
-def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], info_model: str, prompt_text: str, backward_prompt_text: str | None, out_dir: Path, stage: str, label_lookup: dict[str, dict[str, Any]] | None = None) -> None:
+def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], info_model: str, prompt_text: str, backward_prompt_text: str | None, out_dir: Path, stage: str, label_lookup: dict[str, Any] | None = None) -> None:
     _ = backward_prompt_text
     label_lookup = label_lookup or {}
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -729,6 +988,7 @@ def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any]
                 print(f"[{info_model} backward] FAILED {source_id}: {exc}", file=sys.stderr)
 
     write_csv(forward_path, backward_path, out_dir / "roundtrip_outputs.csv")
+    write_label_audit(forward_path, backward_path, out_dir / "label_validation_audit.csv")
 
 
 def main() -> None:
@@ -768,8 +1028,11 @@ def main() -> None:
         "roundtrips_csv": args.roundtrips_csv,
         "prompt_dir": args.prompt_dir,
         "inventory_csv": args.inventory_csv,
-        "backward_prompt_dir": args.backward_prompt_dir,
+        "backward_prompt_dir_deprecated_not_used": args.backward_prompt_dir,
         "stage": args.stage,
+        "prompt_design": "source_model_forward_requires_verbatim_id_label_and_controlled_sentence_decisions",
+        "id_validation": "source_model_inventory_label_validation_with_reserved_non_label_routing",
+        "sentence_level_backward_policy": "controlled_decision_values_only_no_explanatory_summaries",
         "backward_input": STRICT_POLICY,
         "backward_prompt": "universal_annotation_dictionary_relationships",
     }, indent=2))
@@ -781,7 +1044,13 @@ def main() -> None:
         backward_text = backward_path.read_text(errors="replace") if backward_path else None
         out_dir = base_out / info_model
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "prompt_files.json").write_text(json.dumps({"forward_prompt_file": str(prompt_path), "backward_prompt_file_deprecated_not_used": str(backward_path) if backward_path else None, "uses_universal_structured_backward_prompt": True, "backward_input_policy": STRICT_POLICY}, indent=2))
+        (out_dir / "prompt_files.json").write_text(json.dumps({
+            "forward_prompt_file": str(prompt_path),
+            "backward_prompt_file_deprecated_not_used": str(backward_path) if backward_path else None,
+            "uses_universal_structured_backward_prompt": True,
+            "backward_input_policy": STRICT_POLICY,
+            "strict_forward_contract_applied": True,
+        }, indent=2))
         run_info_model(rows, client, model_cfg, info_model, prompt_text, backward_text, out_dir, args.stage, label_lookup)
 
     print(f"Wrote individual-model outputs under {base_out}")
