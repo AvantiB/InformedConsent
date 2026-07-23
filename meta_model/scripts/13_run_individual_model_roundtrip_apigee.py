@@ -31,6 +31,7 @@ def main() -> None:
     ap.add_argument("--roundtrips_csv", required=True)
     ap.add_argument("--prompt_dir", required=True)
     ap.add_argument("--backward_prompt_dir", default=None)
+    ap.add_argument("--inventory_csv", default="meta_model/v0_union/source_element_inventory.csv", help="Optional Union V0/source inventory for static label metadata.")
     ap.add_argument("--model_config_yaml", required=True)
     ap.add_argument("--model_key", required=True)
     ap.add_argument("--output_dir", required=True)
@@ -51,6 +52,7 @@ def main() -> None:
 
     rows = mod.load_rows(Path(args.roundtrips_csv), args.limit, args.no_dedupe_sentences)
     model_cfg = mod.load_model_config(Path(args.model_config_yaml), args.model_key)
+    label_lookup = mod.load_label_lookup(Path(args.inventory_csv) if args.inventory_csv else None)
     provider = str(model_cfg.get("provider", ""))
     if provider not in {"mayo_apigee_azure_openai", "apigee_azure_openai"}:
         print(f"[WARN] model_key={args.model_key} provider={provider!r}; still using Apigee wrapper.")
@@ -68,10 +70,11 @@ def main() -> None:
         "info_models": info_models,
         "roundtrips_csv": args.roundtrips_csv,
         "prompt_dir": args.prompt_dir,
+        "inventory_csv": args.inventory_csv,
         "backward_prompt_dir_deprecated_not_used": args.backward_prompt_dir,
         "stage": args.stage,
         "backward_input": mod.STRICT_POLICY,
-        "backward_prompt": "minimal_universal_annotation_only",
+        "backward_prompt": "universal_annotation_dictionary_relationships",
         "chat_transport": "mayo_apigee_azure_openai",
     }, indent=2))
 
@@ -86,10 +89,10 @@ def main() -> None:
         (out_dir / "prompt_files.json").write_text(json.dumps({
             "forward_prompt_file": str(prompt_path),
             "backward_prompt_file_deprecated_not_used": str(backward_path) if backward_path else None,
-            "uses_minimal_universal_backward_prompt": True,
+            "uses_universal_structured_backward_prompt": True,
             "backward_input_policy": mod.STRICT_POLICY,
         }, indent=2))
-        mod.run_info_model(rows, client, model_cfg, info_model, prompt_text, backward_text, out_dir, args.stage)
+        mod.run_info_model(rows, client, model_cfg, info_model, prompt_text, backward_text, out_dir, args.stage, label_lookup)
 
     print(f"Wrote individual-model outputs under {base_out}")
 
