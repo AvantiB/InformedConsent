@@ -5,11 +5,13 @@ Forward mapping remains overlap-aware and may include rich audit material for
 human review. The forward output is validated against the authoritative Union V0
 inventory table: every span annotation must use a valid union_element_id and,
 for fresh runs, should also return the exact source_element_label copied from
-the same inventory row. Backward evaluation uses one universal structured
-protocol: valid span annotations enriched with static dictionary metadata,
-sanitized relationship links, and eligible sentence-level annotations. Rows with
-no backward-eligible annotations are not sent to the LLM; their reconstruction is
-intentionally blank.
+the same inventory row. If the LLM mistakenly places unmatched_language or other
+reserved non-label strings inside annotations, the validator routes those spans
+back to unmatched-language audit instead of counting them as dictionary-ID
+failures. Backward evaluation uses one universal structured protocol: valid span
+annotations enriched with static dictionary metadata, sanitized relationship
+links, and eligible sentence-level annotations. Rows with no backward-eligible
+annotations are not sent to the LLM; their reconstruction is intentionally blank.
 """
 from __future__ import annotations
 
@@ -41,6 +43,7 @@ TEXT_COL_CANDIDATES = ["canonical_full_text", "full_text_original", "original_se
 ID_COL_CANDIDATES = ["sentence_id", "source_sentence_id", "roundtrip_id", "id"]
 STRICT_POLICY = "annotation_dictionary_relationships"
 NO_ANNOTATION_NOTE = "Annotation evidence was empty or insufficient."
+RESERVED_NON_LABEL_IDS = {"", "unmatched_language", "unmatched", "no_match", "no match", "none", "null", "unknown", "invalid", "n/a", "na"}
 RELATIONSHIP_TYPES = {
     "same_span_multiple_labels",
     "same_span_multiple_fields",
@@ -99,6 +102,10 @@ def norm_text(x: Any) -> str:
 
 def norm_label(x: Any) -> str:
     return norm_text(x).casefold()
+
+
+def is_reserved_non_label_id(x: Any) -> bool:
+    return norm_text(x).casefold() in RESERVED_NON_LABEL_IDS
 
 
 def pick_col(df: pd.DataFrame, candidates: list[str], required: bool = True) -> str | None:
@@ -275,6 +282,8 @@ def repair_union_id(uid: Any, label: str, maps: dict[str, Any]) -> tuple[str, st
     uid = uid.strip()
     if not uid:
         return uid, "invalid", "empty"
+    if is_reserved_non_label_id(uid):
+        return uid, "routed_to_unmatched", "reserved_non_label_id"
     if uid in maps["valid_ids"]:
         if label and not label_matches_union_id(label, uid, maps):
             return uid, "invalid", "label_mismatch_for_exact_union_id"
@@ -311,14 +320,43 @@ def repair_union_id(uid: Any, label: str, maps: dict[str, Any]) -> tuple[str, st
     return uid, "invalid", "no_inventory_match"
 
 
+def ensure_unmatched_language_list(obj: dict[str, Any]) -> list[dict[str, str]]:
+    existing = obj.get("unmatched_language")
+    if not isinstance(existing, list):
+        existing = []
+    out: list[dict[str, str]] = []
+    for item in existing:
+        if isinstance(item, dict):
+            span = norm_text(item.get("span_text"))
+            reason = norm_text(item.get("reason"))
+            if span or reason:
+                out.append({"span_text": span, "reason": reason})
+        elif norm_text(item):
+            out.append({"span_text": norm_text(item), "reason": "raw_unmatched_language_string"})
+    return out
+
+
+def add_routed_unmatched(obj: dict[str, Any], ann: dict[str, Any], reason: str) -> None:
+    unmatched = ensure_unmatched_language_list(obj)
+    span = norm_text(ann.get("span_text"))
+    if span:
+        key = (span.casefold(), reason.casefold())
+        seen = {(norm_text(x.get("span_text")).casefold(), norm_text(x.get("reason")).casefold()) for x in unmatched if isinstance(x, dict)}
+        if key not in seen:
+            unmatched.append({"span_text": span, "reason": reason})
+    obj["unmatched_language"] = unmatched
+
+
 def validate_forward_obj(forward_obj: dict[str, Any], maps: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     obj = copy.deepcopy(forward_obj)
     annotations = obj.get("annotations") or []
     if not isinstance(annotations, list):
         annotations = []
+    obj["unmatched_language"] = ensure_unmatched_language_list(obj)
     valid_annotations: list[dict[str, Any]] = []
     invalid_annotations: list[dict[str, Any]] = []
-    n_valid = n_repaired = n_invalid = 0
+    routed_unmatched_annotations: list[dict[str, Any]] = []
+    n_valid = n_repaired = n_invalid = n_routed_unmatched = 0
     for ann in annotations:
         if not isinstance(ann, dict):
             n_invalid += 1
@@ -331,6 +369,13 @@ def validate_forward_obj(forward_obj: dict[str, Any], maps: dict[str, Any]) -> t
         ann["returned_source_element_label"] = returned_label
         ann["id_validation_status"] = status
         ann["id_validation_reason"] = reason
+        if status == "routed_to_unmatched":
+            n_routed_unmatched += 1
+            routed = copy.deepcopy(ann)
+            routed["invalid_union_element_id"] = original_uid
+            routed_unmatched_annotations.append(routed)
+            add_routed_unmatched(obj, ann, "LLM placed reserved non-label ID inside annotations; routed to unmatched_language audit.")
+            continue
         if status in {"valid", "repaired"}:
             meta = maps["metadata_by_union_id"].get(repaired_uid, {})
             ann["source_element_label"] = meta.get("label_name", returned_label)
@@ -352,14 +397,17 @@ def validate_forward_obj(forward_obj: dict[str, Any], maps: dict[str, Any]) -> t
             invalid_annotations.append(bad)
     obj["annotations"] = valid_annotations
     obj["invalid_annotations"] = invalid_annotations
+    obj["routed_unmatched_annotations"] = routed_unmatched_annotations
     validation = {
         "n_annotations_raw": len(annotations),
         "n_annotations_valid": n_valid,
         "n_annotations_repaired": n_repaired,
         "n_annotations_invalid": n_invalid,
+        "n_annotations_routed_to_unmatched": n_routed_unmatched,
         "n_annotations_backward_eligible": len(valid_annotations),
         "n_interpretation_units": len(obj.get("interpretation_units") or []) if isinstance(obj.get("interpretation_units"), list) else 0,
         "has_invalid_ids": n_invalid > 0,
+        "has_routed_unmatched_annotations": n_routed_unmatched > 0,
     }
     obj["validation_summary"] = validation
     return obj, validation
@@ -586,13 +634,15 @@ Important context:
 - The same or similar text span MAY receive more than one label.
 - A larger phrase may receive a broader role, while a nested shorter phrase may receive a narrower or more specific role.
 - Preserve overlaps/nesting relationships rather than forcing a single label too early.
+- A phrase may be annotated with a general dictionary class even when the phrase is a named instance and the exact phrase is not in the dictionary. For example, a named database, repository, dataset, or biobank can be labeled with the best valid dictionary concept for that type when present.
 
 Hard dictionary rules:
 - Every annotation MUST copy union_element_id exactly from one dictionary row.
 - Every annotation MUST copy source_element_label exactly from the same dictionary row.
 - Do not invent IDs, labels, fields, or namespaces.
-- Do not output unmatched_language as a union_element_id.
-- If no dictionary row fits, put the phrase in unmatched_language instead of creating an annotation.
+- Never use these reserved non-label strings as union_element_id: unmatched_language, unmatched, no_match, none, null, unknown, invalid, n/a.
+- unmatched_language is only the name of the top-level audit list. It is never a dictionary label and never a valid union_element_id.
+- If no dictionary row fits, put the phrase only in the top-level unmatched_language list and do not create an annotation object for that phrase.
 - If you are uncertain whether an ID/label pair is valid, do not annotate that phrase.
 
 Annotation rules:
@@ -696,6 +746,7 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
         validation = fwd.get("validation_summary") or parsed.get("validation_summary") or {}
         annotations = parsed.get("annotations") or []
         invalid_annotations = parsed.get("invalid_annotations") or []
+        routed_unmatched_annotations = parsed.get("routed_unmatched_annotations") or []
         units = parsed.get("interpretation_units") or []
         bwd = backward.get(source_id, {})
         packet = bwd.get("backward_packet", {})
@@ -710,6 +761,7 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
             "n_annotations_valid": validation.get("n_annotations_valid", ""),
             "n_annotations_repaired": validation.get("n_annotations_repaired", ""),
             "n_annotations_invalid": validation.get("n_annotations_invalid", ""),
+            "n_annotations_routed_to_unmatched": validation.get("n_annotations_routed_to_unmatched", ""),
             "n_annotations_backward_eligible": len(strict_items),
             "n_relationship_links_backward_eligible": audit.get("n_relationship_links_backward_eligible", ""),
             "n_full_sentence_spans_dropped": audit.get("n_full_sentence_spans_dropped", ""),
@@ -723,6 +775,8 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
             "backward_input_policy": packet.get("backward_input_policy", STRICT_POLICY),
             "annotations_json": json.dumps(annotations, ensure_ascii=False),
             "invalid_annotations_json": json.dumps(invalid_annotations, ensure_ascii=False),
+            "routed_unmatched_annotations_json": json.dumps(routed_unmatched_annotations, ensure_ascii=False),
+            "unmatched_language_json": json.dumps(parsed.get("unmatched_language") or [], ensure_ascii=False),
             "interpretation_units_json": json.dumps(units, ensure_ascii=False),
             "backward_packet_json": json.dumps(packet, ensure_ascii=False),
             "backward_annotation_audit_json": json.dumps(audit, ensure_ascii=False),
@@ -737,7 +791,12 @@ def write_invalid_id_audit(forward_path: Path, audit_csv: Path) -> None:
     forward = load_jsonl_by_id(forward_path)
     for source_id, fwd in forward.items():
         parsed = fwd.get("parsed_forward") or {}
-        for group, status_group in [(parsed.get("annotations") or [], "valid_or_repaired"), (parsed.get("invalid_annotations") or [], "invalid")]:
+        groups = [
+            (parsed.get("annotations") or [], "valid_or_repaired"),
+            (parsed.get("invalid_annotations") or [], "invalid"),
+            (parsed.get("routed_unmatched_annotations") or [], "routed_to_unmatched"),
+        ]
+        for group, status_group in groups:
             if not isinstance(group, list):
                 continue
             for ann in group:
@@ -776,7 +835,7 @@ def run_forward(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], d
             parsed, validation = validate_forward_obj(parsed_raw, maps)
             append_jsonl(forward_path, {"source_id": source_id, "source_text": row["_source_text"], "model_key": model_cfg["model_key"], "model": model_cfg["model"], "stage": "forward", "parse_ok": True, "validation_summary": validation, "parsed_forward": parsed, "raw_response": raw})
             done.add(source_id)
-            print(f"[forward] {i + 1}/{len(rows)} ok {source_id} valid={validation['n_annotations_valid']} repaired={validation['n_annotations_repaired']} invalid={validation['n_annotations_invalid']}")
+            print(f"[forward] {i + 1}/{len(rows)} ok {source_id} valid={validation['n_annotations_valid']} repaired={validation['n_annotations_repaired']} invalid={validation['n_annotations_invalid']} routed_unmatched={validation['n_annotations_routed_to_unmatched']}")
         except Exception as exc:
             append_jsonl(failures_path, {"source_id": source_id, "stage": "forward", "error": repr(exc)})
             print(f"[forward] {i + 1}/{len(rows)} FAILED {source_id}: {exc}", file=sys.stderr)
@@ -841,8 +900,8 @@ def main() -> None:
         "n_union_elements": int(len(inv)),
         "inventory_csv": args.inventory_csv,
         "roundtrips_csv": args.roundtrips_csv,
-        "prompt_design": "overlap_aware_forward_requires_verbatim_id_and_label",
-        "id_validation": "exact_id_plus_label_validation_with_safe_format_repairs",
+        "prompt_design": "overlap_aware_forward_requires_verbatim_id_and_label_and_routes_unmatched_audit",
+        "id_validation": "exact_id_plus_label_validation_with_reserved_non_label_routing",
         "backward_input": STRICT_POLICY,
         "backward_prompt": "universal_annotation_dictionary_relationships",
     }
