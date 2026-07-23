@@ -2,10 +2,10 @@
 """Run Union V0 full-dictionary forward/backward round-trip experiments.
 
 Forward mapping remains overlap-aware and may include rich audit material for
-human review. Backward evaluation is strict and universal: the backward LLM
-receives only the annotation-only mapping built from valid span annotations and
-eligible sentence-level annotations. Rows with no backward-eligible annotations
-are not sent to the LLM; their reconstruction is intentionally blank.
+human review. Backward evaluation uses one universal structured protocol: valid
+span annotations enriched with static dictionary metadata, sanitized relationship
+links, and eligible sentence-level annotations. Rows with no backward-eligible
+annotations are not sent to the LLM; their reconstruction is intentionally blank.
 """
 from __future__ import annotations
 
@@ -35,8 +35,18 @@ except ImportError as exc:
 
 TEXT_COL_CANDIDATES = ["canonical_full_text", "full_text_original", "original_sentence", "full_text", "sentence", "text"]
 ID_COL_CANDIDATES = ["sentence_id", "source_sentence_id", "roundtrip_id", "id"]
-STRICT_POLICY = "strict_annotation_only"
+STRICT_POLICY = "annotation_dictionary_relationships"
 NO_ANNOTATION_NOTE = "Annotation evidence was empty or insufficient."
+RELATIONSHIP_TYPES = {
+    "same_span_multiple_labels",
+    "same_span_multiple_fields",
+    "nested_broad_narrow",
+    "complementary_roles",
+    "complementary_fields",
+    "single",
+    "conflicting_or_uncertain",
+    "unknown",
+}
 
 UNIVERSAL_BACKWARD_SYSTEM = (
     "You reconstruct informed-consent sentence meaning from an annotation-only mapping. "
@@ -47,8 +57,21 @@ Task: reconstruct one concise natural-language consent sentence using only the a
 
 Instructions:
 - Use only information explicitly present in the annotation-only mapping.
+- Use label_name and label_definition to interpret annotation labels.
+- Use relationship_links only as structural cues for how listed annotations relate to each other.
+- Relationship links do not add source wording beyond the annotation spans and static label metadata.
 - Preserve the order indicated by sentence_order_index when available.
+- You may add minimal grammar/function words needed to make the reconstruction readable, but do not add unsupported content.
 - If the annotation evidence is empty or insufficient, return an empty reconstructed_sentence and explain that annotation evidence was insufficient.
+
+Relationship link types:
+- same_span_multiple_labels: the listed annotations describe the same evidence span using multiple labels.
+- same_span_multiple_fields: the listed annotations describe the same evidence span using multiple fields.
+- nested_broad_narrow: the listed annotations describe overlapping or nested spans where one is broader and another is narrower.
+- complementary_roles: the listed annotations describe different parts of one local meaning unit.
+- complementary_fields: the listed annotations describe different fields that should be considered together.
+- single: the source forward output marked this as a one-annotation unit.
+- conflicting_or_uncertain: the relationship among the listed annotations is uncertain or potentially conflicting.
 
 Annotation-only mapping:
 {mapping_text}
@@ -123,43 +146,95 @@ def build_dictionary_text(inv: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def normalized_id_key(x: Any) -> str:
+    raw = norm_text(x).lower()
+    parts = re.split(r"[^a-z0-9]+", raw)
+    out = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            out.append(str(int(part)))
+        else:
+            out.append(part)
+    return "|".join(out)
+
+
+def add_norm_index(index: dict[str, set[str]], key: Any, union_id: str) -> None:
+    norm_key = normalized_id_key(key)
+    if norm_key:
+        index.setdefault(norm_key, set()).add(union_id)
+
+
+def metadata_from_row(row: pd.Series) -> dict[str, Any]:
+    return {
+        "label_id": norm_text(row["union_element_id"]),
+        "source_model": norm_text(row["source_model"]),
+        "source_element_id": norm_text(row["source_element_id"]),
+        "label_name": norm_text(row["source_element_label"]),
+        "label_definition": norm_text(row["source_element_definition"]),
+        "element_scope": norm_text(row.get("element_scope", "span")),
+    }
+
+
 def build_inventory_maps(inv: pd.DataFrame) -> dict[str, Any]:
     valid_ids = set(inv["union_element_id"].astype(str))
     by_pair: dict[tuple[str, str], str] = {}
     by_source_id: dict[str, list[str]] = {}
+    normalized_index: dict[str, set[str]] = {}
+    metadata_by_union_id: dict[str, dict[str, Any]] = {}
     for _, row in inv.iterrows():
         source_model = str(row["source_model"])
         source_element_id = str(row["source_element_id"])
+        source_label = str(row["source_element_label"])
         union_element_id = str(row["union_element_id"])
+        metadata_by_union_id[union_element_id] = metadata_from_row(row)
         aliases = {source_model, source_model.replace("_Consent", ""), source_model.replace("_", "")}
         for alias in aliases:
             by_pair[(alias, source_element_id)] = union_element_id
+            add_norm_index(normalized_index, f"{alias}::{source_element_id}", union_element_id)
+            add_norm_index(normalized_index, f"{alias}:{source_element_id}", union_element_id)
             if ":" in source_element_id:
                 prefix, suffix = source_element_id.split(":", 1)
                 if alias == prefix:
                     by_pair[(alias, suffix)] = union_element_id
+                    add_norm_index(normalized_index, f"{alias}::{suffix}", union_element_id)
         by_source_id.setdefault(source_element_id, []).append(union_element_id)
-    return {"valid_ids": valid_ids, "by_pair": by_pair, "by_source_id": by_source_id}
+        add_norm_index(normalized_index, union_element_id, union_element_id)
+        add_norm_index(normalized_index, source_element_id, union_element_id)
+        add_norm_index(normalized_index, source_label, union_element_id)
+    return {
+        "valid_ids": valid_ids,
+        "by_pair": by_pair,
+        "by_source_id": by_source_id,
+        "normalized_index": normalized_index,
+        "metadata_by_union_id": metadata_by_union_id,
+    }
 
 
-def repair_union_id(uid: Any, maps: dict[str, Any]) -> tuple[str, str]:
+def repair_union_id(uid: Any, maps: dict[str, Any]) -> tuple[str, str, str]:
     if not isinstance(uid, str):
-        return str(uid), "invalid"
+        return str(uid), "invalid", "not_string"
     uid = uid.strip()
     if not uid:
-        return uid, "invalid"
+        return uid, "invalid", "empty"
     if uid in maps["valid_ids"]:
-        return uid, "valid"
+        return uid, "valid", "exact_union_id"
     matches = maps["by_source_id"].get(uid, [])
     if len(matches) == 1:
-        return matches[0], "repaired"
+        return matches[0], "repaired", "exact_source_element_id"
     if "::" not in uid and ":" in uid:
         source_model, rest = uid.split(":", 1)
         candidates = [(source_model, rest), (source_model, f"{source_model}:{rest}"), (source_model.replace("FHIR", "FHIR_Consent"), rest)]
         for key in candidates:
             if key in maps["by_pair"]:
-                return maps["by_pair"][key], "repaired"
-    return uid, "invalid"
+                return maps["by_pair"][key], "repaired", "source_model_pair"
+    norm_matches = maps["normalized_index"].get(normalized_id_key(uid), set())
+    if len(norm_matches) == 1:
+        return next(iter(norm_matches)), "repaired", "normalized_id_match"
+    if len(norm_matches) > 1:
+        return uid, "invalid", "ambiguous_normalized_id_match"
+    return uid, "invalid", "no_inventory_match"
 
 
 def validate_forward_obj(forward_obj: dict[str, Any], maps: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -176,9 +251,10 @@ def validate_forward_obj(forward_obj: dict[str, Any], maps: dict[str, Any]) -> t
             invalid_annotations.append({"raw_annotation": ann, "id_validation_status": "invalid_non_object"})
             continue
         original_uid = ann.get("union_element_id", "")
-        repaired_uid, status = repair_union_id(original_uid, maps)
+        repaired_uid, status, reason = repair_union_id(original_uid, maps)
         ann = copy.deepcopy(ann)
         ann["id_validation_status"] = status
+        ann["id_validation_reason"] = reason
         if status == "valid":
             n_valid += 1
             valid_annotations.append(ann)
@@ -231,30 +307,48 @@ def is_full_sentence_like(span: Any, source_text: str, threshold: float = 0.85) 
     return len(s1.split()) / max(1, len(s2.split())) >= threshold and (s1 in s2 or s2 in s1)
 
 
-def ordered_annotations_for_backward(parsed_forward: dict[str, Any], source_text: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
+def annotation_item(ann: dict[str, Any], source_text: str, maps: dict[str, Any]) -> dict[str, Any] | None:
+    span = norm_text(ann.get("span_text", ""))
+    uid = norm_text(ann.get("union_element_id", ""))
+    if not span or not uid or is_full_sentence_like(span, source_text):
+        return None
+    start, end = find_span_bounds(source_text, span)
+    meta = maps["metadata_by_union_id"].get(uid, {})
+    item = {
+        "annotation_id": norm_text(ann.get("annotation_id")),
+        "span_text": span,
+        "label_id": uid,
+        "label": uid,
+        "label_name": meta.get("label_name", ""),
+        "label_definition": meta.get("label_definition", ""),
+        "source_model": meta.get("source_model", ""),
+        "source_element_id": meta.get("source_element_id", ""),
+        "element_scope": meta.get("element_scope", ""),
+        "id_resolution_status": norm_text(ann.get("id_validation_status")),
+        "id_resolution_reason": norm_text(ann.get("id_validation_reason")),
+        "span_relation": norm_text(ann.get("span_relation")),
+        "overlap_group_id": norm_text(ann.get("overlap_group_id")),
+        "span_start": start,
+        "span_end": end,
+    }
+    if norm_text(ann.get("original_union_element_id")):
+        item["original_label_id"] = norm_text(ann.get("original_union_element_id"))
+    return item
+
+
+def ordered_annotations_for_backward(parsed_forward: dict[str, Any], source_text: str, maps: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, int]]:
     annotations = parsed_forward.get("annotations") or []
     ordered: list[dict[str, Any]] = []
     dropped_full_sentence = 0
     for ann in annotations:
         if not isinstance(ann, dict):
             continue
-        span = norm_text(ann.get("span_text", ""))
-        uid = norm_text(ann.get("union_element_id", ""))
-        if not span or not uid:
-            continue
-        if is_full_sentence_like(span, source_text):
+        if is_full_sentence_like(ann.get("span_text", ""), source_text):
             dropped_full_sentence += 1
             continue
-        start, end = find_span_bounds(source_text, span)
-        ordered.append({
-            "annotation_id": norm_text(ann.get("annotation_id")),
-            "span_text": span,
-            "label": uid,
-            "span_relation": norm_text(ann.get("span_relation")),
-            "overlap_group_id": norm_text(ann.get("overlap_group_id")),
-            "span_start": start,
-            "span_end": end,
-        })
+        item = annotation_item(ann, source_text, maps)
+        if item is not None:
+            ordered.append(item)
     ordered = sorted(ordered, key=lambda item: (10**9 if item.get("span_start") is None else int(item.get("span_start")), -int((item.get("span_end") or item.get("span_start") or 0) - (item.get("span_start") or 0)), str(item.get("annotation_id", ""))))
     for i, ann in enumerate(ordered, start=1):
         ann["sentence_order_index"] = i
@@ -278,16 +372,62 @@ def eligible_sentence_level_annotations(parsed_forward: dict[str, Any], has_vali
     return out
 
 
-def build_backward_packet(parsed_forward: dict[str, Any], source_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    ordered, audit = ordered_annotations_for_backward(parsed_forward, source_text)
+def normalize_relationship_type(x: Any) -> str:
+    rel = norm_text(x).lower().replace(" ", "_").replace("-", "_")
+    if not rel:
+        return "unknown"
+    aliases = {
+        "same_span_multiple_label": "same_span_multiple_labels",
+        "same_span_multiple_fields": "same_span_multiple_fields",
+        "nested_broad_narrow": "nested_broad_narrow",
+        "nested_broader_narrower": "nested_broad_narrow",
+        "broad_narrow": "nested_broad_narrow",
+        "complementary_role": "complementary_roles",
+        "complementary_roles": "complementary_roles",
+        "complementary_fields": "complementary_fields",
+        "single": "single",
+        "conflicting_or_uncertain": "conflicting_or_uncertain",
+        "conflicting": "conflicting_or_uncertain",
+        "uncertain": "conflicting_or_uncertain",
+    }
+    return aliases.get(rel, rel if rel in RELATIONSHIP_TYPES else "unknown")
+
+
+def sanitized_relationship_links(parsed_forward: dict[str, Any], valid_annotation_ids: set[str]) -> list[dict[str, Any]]:
+    links = []
+    units = parsed_forward.get("interpretation_units") or []
+    if not isinstance(units, list):
+        return links
+    for idx, unit in enumerate(units, start=1):
+        if not isinstance(unit, dict):
+            continue
+        ann_ids_raw = unit.get("annotation_ids") or []
+        if not isinstance(ann_ids_raw, list):
+            ann_ids_raw = []
+        ann_ids = [norm_text(x) for x in ann_ids_raw if norm_text(x) in valid_annotation_ids]
+        if len(ann_ids) < 2:
+            continue
+        links.append({
+            "relationship_id": norm_text(unit.get("unit_id")) or f"rel{idx}",
+            "relationship_type": normalize_relationship_type(unit.get("relationship")),
+            "annotation_ids": ann_ids,
+        })
+    return links
+
+
+def build_backward_packet(parsed_forward: dict[str, Any], source_text: str, maps: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    ordered, audit = ordered_annotations_for_backward(parsed_forward, source_text, maps)
+    valid_annotation_ids = {norm_text(x.get("annotation_id")) for x in ordered if norm_text(x.get("annotation_id"))}
     packet = {
         "backward_input_policy": STRICT_POLICY,
         "ordered_reconstruction_items": ordered,
+        "relationship_links": sanitized_relationship_links(parsed_forward, valid_annotation_ids),
         "sentence_level_annotations": eligible_sentence_level_annotations(parsed_forward, bool(ordered)),
     }
     audit = {
         **audit,
         "n_annotations_forward_valid": len(parsed_forward.get("annotations") or []) if isinstance(parsed_forward.get("annotations"), list) else 0,
+        "n_relationship_links_backward_eligible": len(packet["relationship_links"]),
         "n_sentence_level_annotations_backward_eligible": len(packet["sentence_level_annotations"]),
     }
     return packet, audit
@@ -376,7 +516,7 @@ Annotation rules:
 
 Audit rules:
 - You may include interpretation_units and unmatched_language for human audit.
-- These audit fields will not be included in the annotation-only backward mapping.
+- These audit fields will not be included directly in the backward mapping.
 
 Data dictionary:
 {dictionary_text}
@@ -481,6 +621,7 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
             "n_annotations_repaired": validation.get("n_annotations_repaired", ""),
             "n_annotations_invalid": validation.get("n_annotations_invalid", ""),
             "n_annotations_backward_eligible": len(strict_items),
+            "n_relationship_links_backward_eligible": audit.get("n_relationship_links_backward_eligible", ""),
             "n_full_sentence_spans_dropped": audit.get("n_full_sentence_spans_dropped", ""),
             "n_interpretation_units": len(units) if isinstance(units, list) else "",
             "forward_parse_ok": fwd.get("parse_ok", False),
@@ -488,7 +629,7 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
             "reconstructed_sentence": (bwd.get("parsed_backward") or {}).get("reconstructed_sentence", ""),
             "reconstruction_notes": (bwd.get("parsed_backward") or {}).get("reconstruction_notes", ""),
             "annotation_count": len(strict_items),
-            "unique_element_count": len({norm_text(x.get("label")) for x in strict_items if isinstance(x, dict) and norm_text(x.get("label"))}),
+            "unique_element_count": len({norm_text(x.get("label_id") or x.get("label")) for x in strict_items if isinstance(x, dict) and norm_text(x.get("label_id") or x.get("label"))}),
             "backward_input_policy": packet.get("backward_input_policy", STRICT_POLICY),
             "annotations_json": json.dumps(annotations, ensure_ascii=False),
             "invalid_annotations_json": json.dumps(invalid_annotations, ensure_ascii=False),
@@ -521,12 +662,14 @@ def run_forward(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], d
             print(f"[forward] {i + 1}/{len(rows)} FAILED {source_id}: {exc}", file=sys.stderr)
 
 
-def run_backward(client: OpenAI, model_cfg: dict[str, Any], dictionary_text: str, out_dir: Path) -> None:
+def run_backward(client: OpenAI, model_cfg: dict[str, Any], dictionary_text: str, maps: dict[str, Any], out_dir: Path) -> None:
     _ = dictionary_text
     forward_path = out_dir / "union_v0_forward_mappings.jsonl"
     backward_path = out_dir / "union_v0_backward_reconstructions.jsonl"
     failures_path = out_dir / "failed_requests.jsonl"
     forward = load_jsonl_by_id(forward_path)
+    if not forward:
+        raise FileNotFoundError(f"No forward mappings found. Expected non-empty file: {forward_path}")
     done = read_done_keys(backward_path)
     for i, (source_id, fwd) in enumerate(forward.items()):
         if source_id in done:
@@ -534,7 +677,7 @@ def run_backward(client: OpenAI, model_cfg: dict[str, Any], dictionary_text: str
         try:
             parsed_forward = fwd.get("parsed_forward") or {}
             source_text = fwd.get("source_text", "")
-            packet, audit = build_backward_packet(parsed_forward, source_text)
+            packet, audit = build_backward_packet(parsed_forward, source_text, maps)
             if not packet.get("ordered_reconstruction_items"):
                 parsed = {"reconstructed_sentence": "", "reconstruction_notes": NO_ANNOTATION_NOTE}
                 raw = json.dumps(parsed, ensure_ascii=False)
@@ -543,7 +686,7 @@ def run_backward(client: OpenAI, model_cfg: dict[str, Any], dictionary_text: str
                 parsed = extract_json(raw)
             append_jsonl(backward_path, {"source_id": source_id, "source_text": source_text, "model_key": model_cfg["model_key"], "model": model_cfg["model"], "stage": "backward", "parse_ok": True, "backward_input_sanitized": True, "backward_input_policy": STRICT_POLICY, "backward_packet": packet, "backward_annotation_audit": audit, "parsed_backward": parsed, "raw_response": raw})
             done.add(source_id)
-            print(f"[backward] {i + 1}/{len(forward)} ok {source_id} eligible_annotations={len(packet.get('ordered_reconstruction_items') or [])}")
+            print(f"[backward] {i + 1}/{len(forward)} ok {source_id} eligible_annotations={len(packet.get('ordered_reconstruction_items') or [])} links={len(packet.get('relationship_links') or [])}")
         except Exception as exc:
             append_jsonl(failures_path, {"source_id": source_id, "stage": "backward", "error": repr(exc)})
             print(f"[backward] {i + 1}/{len(forward)} FAILED {source_id}: {exc}", file=sys.stderr)
@@ -579,16 +722,16 @@ def main() -> None:
         "inventory_csv": args.inventory_csv,
         "roundtrips_csv": args.roundtrips_csv,
         "prompt_design": "overlap_aware_forward_with_audit_fields",
-        "id_validation": "repair_unambiguous_ids_and_flag_remaining_invalid",
+        "id_validation": "exact_alias_normalized_repair_then_flag_unresolved",
         "backward_input": STRICT_POLICY,
-        "backward_prompt": "minimal_universal_annotation_only",
+        "backward_prompt": "universal_annotation_dictionary_relationships",
     }
     (output_dir / "run_metadata.json").write_text(json.dumps(run_meta, indent=2))
 
     if args.stage in {"forward", "both"}:
         run_forward(rows, client, model_cfg, dictionary_text, maps, output_dir)
     if args.stage in {"backward", "both"}:
-        run_backward(client, model_cfg, dictionary_text, output_dir)
+        run_backward(client, model_cfg, dictionary_text, maps, output_dir)
 
     write_roundtrip_csv(output_dir / "union_v0_forward_mappings.jsonl", output_dir / "union_v0_backward_reconstructions.jsonl", output_dir / "union_v0_roundtrip_outputs.csv")
     print(f"Wrote outputs under {output_dir}")
