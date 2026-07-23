@@ -8,10 +8,13 @@ for fresh runs, should also return the exact source_element_label copied from
 the same inventory row. If the LLM mistakenly places unmatched_language or other
 reserved non-label strings inside annotations, the validator routes those spans
 back to unmatched-language audit instead of counting them as dictionary-ID
-failures. Backward evaluation uses one universal structured protocol: valid span
+failures.
+
+Backward evaluation uses one universal structured protocol: valid span
 annotations enriched with static dictionary metadata, sanitized relationship
-links, and eligible sentence-level annotations. Rows with no backward-eligible
-annotations are not sent to the LLM; their reconstruction is intentionally blank.
+links, and controlled sentence-level decision labels only. Rows with no
+backward-eligible annotations are not sent to the LLM; their reconstruction is
+intentionally blank.
 """
 from __future__ import annotations
 
@@ -44,6 +47,15 @@ ID_COL_CANDIDATES = ["sentence_id", "source_sentence_id", "roundtrip_id", "id"]
 STRICT_POLICY = "annotation_dictionary_relationships"
 NO_ANNOTATION_NOTE = "Annotation evidence was empty or insufficient."
 RESERVED_NON_LABEL_IDS = {"", "unmatched_language", "unmatched", "no_match", "no match", "none", "null", "unknown", "invalid", "n/a", "na"}
+SENTENCE_LEVEL_DECISION_IDS = {
+    "ODRL::Rule_TestSentence",
+    "FHIR_Consent::Consent.provision.type",
+    "FHIR::Consent.provision.type",
+    "FHIR_Consent::Consent.decision",
+    "FHIR::Consent.decision",
+    "DUO::DUO.decision",
+    "ICO::ICO.decision",
+}
 RELATIONSHIP_TYPES = {
     "same_span_multiple_labels",
     "same_span_multiple_fields",
@@ -67,6 +79,7 @@ Instructions:
 - Use label_name and label_definition to interpret annotation labels.
 - Use relationship_links only as structural cues for how listed annotations relate to each other.
 - Relationship links do not add source wording beyond the annotation spans and static label metadata.
+- Use sentence_level_annotations only as controlled consent-force cues attached to the listed span evidence.
 - Preserve the order indicated by sentence_order_index when available.
 - You may add minimal grammar/function words needed to make the reconstruction readable, but do not add unsupported content.
 - If the annotation evidence is empty or insufficient, return an empty reconstructed_sentence and explain that annotation evidence was insufficient.
@@ -301,7 +314,6 @@ def repair_union_id(uid: Any, label: str, maps: dict[str, Any]) -> tuple[str, st
             if key in maps["by_pair"] and label_matches_union_id(label, maps["by_pair"][key], maps):
                 return maps["by_pair"][key], "repaired", "source_model_pair_label_match" if label else "source_model_pair_no_label_returned"
 
-    # Only allow normalized-id repair when the returned label confirms the same inventory row.
     norm_matches = maps["normalized_index"].get(normalized_id_key(uid), set())
     if len(norm_matches) == 1:
         candidate = next(iter(norm_matches))
@@ -312,7 +324,6 @@ def repair_union_id(uid: Any, label: str, maps: dict[str, Any]) -> tuple[str, st
     if len(norm_matches) > 1:
         return uid, "invalid", "ambiguous_normalized_id_match"
 
-    # Last safe rescue: malformed ID plus exact returned source_element_label uniquely identifies one inventory row.
     label_candidate = unique_label_match(label, source_model_hint, maps)
     if label_candidate:
         return label_candidate, "repaired", "unique_source_element_label_match"
@@ -487,21 +498,83 @@ def ordered_annotations_for_backward(parsed_forward: dict[str, Any], source_text
     return ordered, {"n_full_sentence_spans_dropped": dropped_full_sentence, "n_annotations_backward_eligible_strict": len(ordered)}
 
 
-def eligible_sentence_level_annotations(parsed_forward: dict[str, Any], has_valid_span_annotations: bool) -> list[dict[str, Any]]:
+def normalize_sentence_decision_value(value: Any) -> str:
+    raw = norm_text(value)
+    low = raw.casefold()
+    if not low:
+        return ""
+    # Long free-text values are summaries/rationales, not controlled decision labels.
+    if len(raw) > 40 or len(raw.split()) > 4:
+        return ""
+    permit = {"permit", "permission", "permitted", "allow", "allowed", "yes", "consent", "authorized", "authorization"}
+    deny = {"deny", "denial", "prohibition", "prohibit", "prohibited", "forbid", "forbidden", "no", "refuse", "refusal"}
+    obligation = {"duty", "obligation", "obligated", "mandatory", "required", "must"}
+    if low in permit:
+        return "permit"
+    if low in deny:
+        return "deny"
+    if low in obligation:
+        return "obligation"
+    if low in {"mixed", "both"}:
+        return "mixed"
+    if low in {"unclear", "unknown", "not clear", "ambiguous"}:
+        return "unclear"
+    return ""
+
+
+def canonical_sentence_level_element(item: dict[str, Any], maps: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    uid = norm_text(item.get("union_element_id"))
+    label = returned_source_label(item)
+    value = norm_text(item.get("value"))
+    canonical_value = normalize_sentence_decision_value(value)
+    if not uid:
+        return None, "missing_union_element_id"
+    if not canonical_value:
+        return None, "non_controlled_or_explanatory_value"
+    repaired_uid, status, reason = repair_union_id(uid, label, maps)
+    if status not in {"valid", "repaired"}:
+        return None, f"invalid_sentence_level_id:{reason}"
+    meta = maps["metadata_by_union_id"].get(repaired_uid, {})
+    # Keep only known global governance/decision fields. Other sentence-level values may be audit-only.
+    if repaired_uid not in SENTENCE_LEVEL_DECISION_IDS and meta.get("label_name") not in {"Rule_TestSentence", "Consent.provision.type", "Consent.decision"}:
+        return None, "not_approved_sentence_decision_field"
+    out = {
+        "field": "sentence_level_decision",
+        "label_id": repaired_uid,
+        "label_name": meta.get("label_name", label),
+        "label_definition": meta.get("label_definition", ""),
+        "source_model": meta.get("source_model", ""),
+        "source_element_id": meta.get("source_element_id", ""),
+        "value": canonical_value,
+        "support": "valid_span_annotations_present",
+        "id_resolution_status": status,
+        "id_resolution_reason": reason,
+    }
+    if status == "repaired":
+        out["original_label_id"] = uid
+    return out, "included"
+
+
+def eligible_sentence_level_annotations(parsed_forward: dict[str, Any], has_valid_span_annotations: bool, maps: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, int]]:
     if not has_valid_span_annotations:
-        return []
-    out = []
-    if norm_text(parsed_forward.get("sentence_decision")):
-        out.append({"field": "sentence_decision", "value": norm_text(parsed_forward.get("sentence_decision")), "support": "valid_span_annotations_present"})
+        return [], {"n_sentence_level_annotations_backward_eligible": 0, "n_sentence_level_elements_dropped_by_policy": 0}
+    out: list[dict[str, Any]] = []
+    dropped = 0
+    canonical_decision = normalize_sentence_decision_value(parsed_forward.get("sentence_decision"))
+    if canonical_decision:
+        out.append({"field": "sentence_decision", "value": canonical_decision, "support": "valid_span_annotations_present"})
     elems = parsed_forward.get("sentence_level_elements") or []
     if isinstance(elems, list):
         for item in elems:
-            if isinstance(item, dict):
-                val = {k: norm_text(v) for k, v in item.items() if norm_text(v)}
-                if val:
-                    val["support"] = "valid_span_annotations_present"
-                    out.append(val)
-    return out
+            if not isinstance(item, dict):
+                dropped += 1
+                continue
+            canonical, reason = canonical_sentence_level_element(item, maps)
+            if canonical is None:
+                dropped += 1
+                continue
+            out.append(canonical)
+    return out, {"n_sentence_level_annotations_backward_eligible": len(out), "n_sentence_level_elements_dropped_by_policy": dropped}
 
 
 def normalize_relationship_type(x: Any) -> str:
@@ -550,17 +623,18 @@ def sanitized_relationship_links(parsed_forward: dict[str, Any], valid_annotatio
 def build_backward_packet(parsed_forward: dict[str, Any], source_text: str, maps: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     ordered, audit = ordered_annotations_for_backward(parsed_forward, source_text, maps)
     valid_annotation_ids = {norm_text(x.get("annotation_id")) for x in ordered if norm_text(x.get("annotation_id"))}
+    sentence_level, sent_audit = eligible_sentence_level_annotations(parsed_forward, bool(ordered), maps)
     packet = {
         "backward_input_policy": STRICT_POLICY,
         "ordered_reconstruction_items": ordered,
         "relationship_links": sanitized_relationship_links(parsed_forward, valid_annotation_ids),
-        "sentence_level_annotations": eligible_sentence_level_annotations(parsed_forward, bool(ordered)),
+        "sentence_level_annotations": sentence_level,
     }
     audit = {
         **audit,
+        **sent_audit,
         "n_annotations_forward_valid": len(parsed_forward.get("annotations") or []) if isinstance(parsed_forward.get("annotations"), list) else 0,
         "n_relationship_links_backward_eligible": len(packet["relationship_links"]),
-        "n_sentence_level_annotations_backward_eligible": len(packet["sentence_level_annotations"]),
     }
     return packet, audit
 
@@ -652,6 +726,7 @@ Annotation rules:
 - If a broad phrase and a nested narrower phrase both carry meaning, output both annotations and link them with a shared overlap_group_id.
 - Sentence-level elements may be used only in sentence_level_elements, not as span annotations.
 - sentence_decision must be one of: permit, deny, mixed, unclear.
+- sentence_level_elements.value must be a controlled decision value only, e.g., permit, deny, mixed, unclear, Permission, Prohibition, Duty. Do not write explanatory summaries in sentence_level_elements.value.
 
 Audit rules:
 - You may include interpretation_units and unmatched_language for human audit.
@@ -663,7 +738,7 @@ Data dictionary:
 Return JSON with exactly this structure:
 {{
   "sentence_decision": "permit|deny|mixed|unclear",
-  "sentence_level_elements": [{{"union_element_id": "...", "source_element_label": "exact dictionary label", "value": "..."}}],
+  "sentence_level_elements": [{{"union_element_id": "...", "source_element_label": "exact dictionary label", "value": "controlled decision value only"}}],
   "annotations": [
     {{
       "annotation_id": "a1",
@@ -762,6 +837,8 @@ def write_roundtrip_csv(forward_path: Path, backward_path: Path, out_csv: Path) 
             "n_annotations_repaired": validation.get("n_annotations_repaired", ""),
             "n_annotations_invalid": validation.get("n_annotations_invalid", ""),
             "n_annotations_routed_to_unmatched": validation.get("n_annotations_routed_to_unmatched", ""),
+            "n_sentence_level_annotations_backward_eligible": audit.get("n_sentence_level_annotations_backward_eligible", ""),
+            "n_sentence_level_elements_dropped_by_policy": audit.get("n_sentence_level_elements_dropped_by_policy", ""),
             "n_annotations_backward_eligible": len(strict_items),
             "n_relationship_links_backward_eligible": audit.get("n_relationship_links_backward_eligible", ""),
             "n_full_sentence_spans_dropped": audit.get("n_full_sentence_spans_dropped", ""),
@@ -900,8 +977,9 @@ def main() -> None:
         "n_union_elements": int(len(inv)),
         "inventory_csv": args.inventory_csv,
         "roundtrips_csv": args.roundtrips_csv,
-        "prompt_design": "overlap_aware_forward_requires_verbatim_id_and_label_and_routes_unmatched_audit",
+        "prompt_design": "overlap_aware_forward_requires_verbatim_id_label_and_controlled_sentence_decisions",
         "id_validation": "exact_id_plus_label_validation_with_reserved_non_label_routing",
+        "sentence_level_backward_policy": "controlled_decision_values_only_no_explanatory_summaries",
         "backward_input": STRICT_POLICY,
         "backward_prompt": "universal_annotation_dictionary_relationships",
     }
