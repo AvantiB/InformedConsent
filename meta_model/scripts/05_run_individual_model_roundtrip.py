@@ -2,10 +2,11 @@
 """Run individual source-model prompt round-trip experiments.
 
 Forward uses the original source-model forward prompt text and can be reused from
-previous runs. Backward evaluation is strict and universal: it receives only the
-annotation-only mapping built from parsed span annotations and eligible
-sentence-level annotations. Rows with no backward-eligible annotations are not
-sent to the LLM; their reconstruction is intentionally blank.
+previous runs. Backward evaluation uses the same universal structured protocol as
+Union V0: parsed span annotations enriched with static label metadata when
+available, sanitized relationship links, and eligible sentence-level annotations.
+Rows with no backward-eligible annotations are not sent to the LLM; their
+reconstruction is intentionally blank.
 """
 from __future__ import annotations
 
@@ -41,8 +42,18 @@ SPAN_KEYS = ["span_text", "evidence_span_text", "evidence_text", "text_span", "p
 LABEL_KEYS = ["field_name", "field_id", "label", "element", "element_id", "source_element_id", "union_element_id", "node", "term", "class", "category", "path", "role", "type", "id"]
 DECISION_KEYS = ["decision", "polarity", "consent_force", "permission", "rule_type", "value"]
 DECISION_VALUES = {"permit", "deny", "denied", "prohibit", "prohibition", "permission", "obligation", "mixed", "unclear", "allow", "allowed"}
-STRICT_POLICY = "strict_annotation_only"
+STRICT_POLICY = "annotation_dictionary_relationships"
 NO_ANNOTATION_NOTE = "Annotation evidence was empty or insufficient."
+RELATIONSHIP_TYPES = {
+    "same_span_multiple_labels",
+    "same_span_multiple_fields",
+    "nested_broad_narrow",
+    "complementary_roles",
+    "complementary_fields",
+    "single",
+    "conflicting_or_uncertain",
+    "unknown",
+}
 
 UNIVERSAL_BACKWARD_SYSTEM = (
     "You reconstruct informed-consent sentence meaning from an annotation-only mapping. "
@@ -53,8 +64,21 @@ Task: reconstruct one concise natural-language consent sentence using only the a
 
 Instructions:
 - Use only information explicitly present in the annotation-only mapping.
+- Use label_name and label_definition to interpret annotation labels.
+- Use relationship_links only as structural cues for how listed annotations relate to each other.
+- Relationship links do not add source wording beyond the annotation spans and static label metadata.
 - Preserve the order indicated by sentence_order_index when available.
+- You may add minimal grammar/function words needed to make the reconstruction readable, but do not add unsupported content.
 - If the annotation evidence is empty or insufficient, return an empty reconstructed_sentence and explain that annotation evidence was insufficient.
+
+Relationship link types:
+- same_span_multiple_labels: the listed annotations describe the same evidence span using multiple labels.
+- same_span_multiple_fields: the listed annotations describe the same evidence span using multiple fields.
+- nested_broad_narrow: the listed annotations describe overlapping or nested spans where one is broader and another is narrower.
+- complementary_roles: the listed annotations describe different parts of one local meaning unit.
+- complementary_fields: the listed annotations describe different fields that should be considered together.
+- single: the source forward output marked this as a one-annotation unit.
+- conflicting_or_uncertain: the relationship among the listed annotations is uncertain or potentially conflicting.
 
 Annotation-only mapping:
 {mapping_text}
@@ -78,6 +102,17 @@ def norm_text(x: Any) -> str:
 
 def stable_id(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def normalized_key(x: Any) -> str:
+    raw = norm_text(x).lower()
+    parts = re.split(r"[^a-z0-9]+", raw)
+    out = []
+    for part in parts:
+        if not part:
+            continue
+        out.append(str(int(part)) if part.isdigit() else part)
+    return "|".join(out)
 
 
 def pick_col(df: pd.DataFrame, candidates: list[str], required: bool = True) -> str | None:
@@ -105,6 +140,54 @@ def load_rows(roundtrips_csv: Path, limit: int | None, no_dedupe_sentences: bool
     if limit is not None:
         out = out.head(limit).copy()
     return out[["_source_id", "_source_text"]]
+
+
+def load_label_lookup(inventory_csv: Path | None) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    if inventory_csv is None or not inventory_csv.exists():
+        return lookup
+    inv = pd.read_csv(inventory_csv).fillna("")
+    required = {"source_model", "source_element_id", "source_element_label", "source_element_definition", "union_element_id"}
+    if not required.issubset(set(inv.columns)):
+        return lookup
+    for _, row in inv.iterrows():
+        source_model = norm_text(row["source_model"])
+        aliases = {source_model, source_model.replace("_Consent", ""), source_model.replace("_", "")}
+        meta = {
+            "union_label_id": norm_text(row["union_element_id"]),
+            "source_model": source_model,
+            "source_element_id": norm_text(row["source_element_id"]),
+            "label_name": norm_text(row["source_element_label"]),
+            "label_definition": norm_text(row["source_element_definition"]),
+        }
+        candidates = [row["union_element_id"], row["source_element_id"], row["source_element_label"]]
+        for alias in aliases:
+            for cand in candidates:
+                lookup[f"{alias}::{normalized_key(cand)}"] = meta
+                lookup[f"{alias}:{normalized_key(cand)}"] = meta
+        for cand in candidates:
+            lookup[normalized_key(cand)] = meta
+    return lookup
+
+
+def resolve_label_metadata(label: str, info_model: str, lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    keys = [
+        f"{info_model}::{normalized_key(label)}",
+        f"{info_model}:{normalized_key(label)}",
+        f"{info_model.replace('_Consent', '')}::{normalized_key(label)}",
+        f"{info_model.replace('_', '')}::{normalized_key(label)}",
+        normalized_key(label),
+    ]
+    meta = next((lookup[k] for k in keys if k in lookup), {})
+    return {
+        "label_id": label,
+        "label": label,
+        "union_label_id": meta.get("union_label_id", ""),
+        "label_name": meta.get("label_name", label),
+        "label_definition": meta.get("label_definition", ""),
+        "source_model": meta.get("source_model", info_model),
+        "source_element_id": meta.get("source_element_id", label),
+    }
 
 
 def load_model_config(path: Path, model_key: str) -> dict[str, Any]:
@@ -155,8 +238,6 @@ def find_prompt_file(prompt_dir: Path, info_model: str) -> Path:
 
 
 def find_backward_prompt_file(backward_dir: Path | None, info_model: str) -> Path | None:
-    # Retained for backwards-compatible CLI metadata only. The evaluator always
-    # uses the universal prompt in this script.
     if backward_dir is None or not backward_dir.exists():
         return None
     patterns = PROMPT_PATTERNS[info_model]
@@ -430,15 +511,64 @@ def extract_sentence_level_annotations(raw_forward: str, has_valid_span_annotati
     return out
 
 
-def build_sanitized_forward_material(raw_forward: str, source_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def normalize_relationship_type(x: Any) -> str:
+    rel = norm_text(x).lower().replace(" ", "_").replace("-", "_")
+    if not rel:
+        return "unknown"
+    aliases = {
+        "same_span_multiple_label": "same_span_multiple_labels",
+        "same_span_multiple_labels": "same_span_multiple_labels",
+        "same_span_multiple_fields": "same_span_multiple_fields",
+        "same_span_multiple_field": "same_span_multiple_fields",
+        "nested_broader_narrower": "nested_broad_narrow",
+        "nested_broad_narrow": "nested_broad_narrow",
+        "broad_narrow": "nested_broad_narrow",
+        "complementary_role": "complementary_roles",
+        "complementary_roles": "complementary_roles",
+        "complementary_fields": "complementary_fields",
+        "single": "single",
+        "conflicting": "conflicting_or_uncertain",
+        "uncertain": "conflicting_or_uncertain",
+        "conflicting_or_uncertain": "conflicting_or_uncertain",
+    }
+    return aliases.get(rel, rel if rel in RELATIONSHIP_TYPES else "unknown")
+
+
+def extract_relationship_links(raw_forward: str, valid_annotation_ids: set[str]) -> list[dict[str, Any]]:
+    try:
+        parsed = extract_json(raw_forward)
+    except Exception:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    units = parsed.get("interpretation_units") or []
+    if not isinstance(units, list):
+        return []
+    links = []
+    for idx, unit in enumerate(units, start=1):
+        if not isinstance(unit, dict):
+            continue
+        ids = unit.get("annotation_ids") or []
+        if not isinstance(ids, list):
+            ids = []
+        ann_ids = [norm_text(x) for x in ids if norm_text(x) in valid_annotation_ids]
+        if len(ann_ids) < 2:
+            continue
+        links.append({"relationship_id": norm_text(unit.get("unit_id")) or f"rel{idx}", "relationship_type": normalize_relationship_type(unit.get("relationship")), "annotation_ids": ann_ids})
+    return links
+
+
+def build_sanitized_forward_material(raw_forward: str, source_text: str, info_model: str, label_lookup: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
     annotations, audit = parse_span_annotations(raw_forward, source_text)
     ordered = []
     for ann in annotations:
         start, end = find_span_bounds(source_text, ann.get("span_text", ""))
+        label = norm_text(ann.get("label", ""))
+        meta = resolve_label_metadata(label, info_model, label_lookup)
         ordered.append({
             "annotation_id": ann.get("annotation_id", ""),
             "span_text": ann.get("span_text", ""),
-            "label": ann.get("label", ""),
+            **meta,
             "decision_or_polarity": ann.get("decision_or_polarity", ""),
             "span_relation": ann.get("span_relation", ""),
             "overlap_group_id": ann.get("overlap_group_id", ""),
@@ -448,12 +578,18 @@ def build_sanitized_forward_material(raw_forward: str, source_text: str) -> tupl
     ordered.sort(key=lambda x: (10**9 if x.get("span_start") is None else int(x.get("span_start")), str(x.get("annotation_id", ""))))
     for i, item in enumerate(ordered, start=1):
         item["sentence_order_index"] = i
+    valid_annotation_ids = {norm_text(x.get("annotation_id")) for x in ordered if norm_text(x.get("annotation_id"))}
     packet = {
         "backward_input_policy": STRICT_POLICY,
         "ordered_reconstruction_items": ordered,
+        "relationship_links": extract_relationship_links(raw_forward, valid_annotation_ids),
         "sentence_level_annotations": extract_sentence_level_annotations(raw_forward, bool(ordered)),
     }
-    audit = {**audit, "n_sentence_level_annotations_backward_eligible": len(packet["sentence_level_annotations"])}
+    audit = {
+        **audit,
+        "n_relationship_links_backward_eligible": len(packet["relationship_links"]),
+        "n_sentence_level_annotations_backward_eligible": len(packet["sentence_level_annotations"]),
+    }
     return packet, audit
 
 
@@ -531,8 +667,9 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
             "sanitized_forward_material_json": json.dumps(packet, ensure_ascii=False),
             "backward_annotation_audit_json": json.dumps(audit, ensure_ascii=False),
             "annotation_count": len(items),
-            "unique_element_count": len({norm_text(x.get("label")) for x in items if isinstance(x, dict) and norm_text(x.get("label"))}),
+            "unique_element_count": len({norm_text(x.get("label_id") or x.get("label")) for x in items if isinstance(x, dict) and norm_text(x.get("label_id") or x.get("label"))}),
             "n_annotations_backward_eligible": len(items),
+            "n_relationship_links_backward_eligible": audit.get("n_relationship_links_backward_eligible", ""),
             "n_full_sentence_spans_dropped": audit.get("n_full_sentence_spans_dropped", ""),
             "annotation_parse_mode": audit.get("annotation_parse_mode", ""),
             "forward_parse_ok": bool(items) or bool(f.get("raw_response", "")),
@@ -543,8 +680,9 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
     pd.DataFrame(rows).to_csv(out_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 
 
-def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], info_model: str, prompt_text: str, backward_prompt_text: str | None, out_dir: Path, stage: str) -> None:
+def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], info_model: str, prompt_text: str, backward_prompt_text: str | None, out_dir: Path, stage: str, label_lookup: dict[str, dict[str, Any]] | None = None) -> None:
     _ = backward_prompt_text
+    label_lookup = label_lookup or {}
     out_dir.mkdir(parents=True, exist_ok=True)
     forward_path = out_dir / "forward_mappings.jsonl"
     backward_path = out_dir / "backward_reconstructions.jsonl"
@@ -568,13 +706,15 @@ def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any]
 
     if stage in {"backward", "both"}:
         fwd_by_id = load_jsonl_by_id(forward_path)
+        if not fwd_by_id:
+            raise FileNotFoundError(f"No forward mappings found for {info_model}. Expected non-empty file: {forward_path}")
         done = read_done(backward_path)
         for i, (source_id, fwd) in enumerate(fwd_by_id.items()):
             if source_id in done:
                 continue
             try:
                 source_text = fwd.get("source_text", "")
-                sanitized_material, audit = build_sanitized_forward_material(fwd.get("raw_response", ""), source_text)
+                sanitized_material, audit = build_sanitized_forward_material(fwd.get("raw_response", ""), source_text, info_model, label_lookup)
                 if not sanitized_material.get("ordered_reconstruction_items"):
                     parsed_back = {"reconstructed_sentence": "", "reconstruction_notes": NO_ANNOTATION_NOTE}
                     raw = json.dumps(parsed_back, ensure_ascii=False)
@@ -583,7 +723,7 @@ def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any]
                     parsed_back = parse_backward_response(raw)
                 append_jsonl(backward_path, {"source_id": source_id, "source_text": source_text, "model_key": model_cfg["model_key"], "model": model_cfg["model"], "info_model": info_model, "stage": "backward", "backward_input_sanitized": True, "backward_input_policy": STRICT_POLICY, "sanitized_forward_material": sanitized_material, "backward_annotation_audit": audit, "parsed_backward": parsed_back, "parse_ok": True, "raw_response": raw})
                 done.add(source_id)
-                print(f"[{info_model} backward] {i + 1}/{len(fwd_by_id)} ok {source_id} eligible_annotations={len(sanitized_material.get('ordered_reconstruction_items') or [])}")
+                print(f"[{info_model} backward] {i + 1}/{len(fwd_by_id)} ok {source_id} eligible_annotations={len(sanitized_material.get('ordered_reconstruction_items') or [])} links={len(sanitized_material.get('relationship_links') or [])}")
             except Exception as exc:
                 append_jsonl(failures_path, {"source_id": source_id, "info_model": info_model, "stage": "backward", "error": repr(exc)})
                 print(f"[{info_model} backward] FAILED {source_id}: {exc}", file=sys.stderr)
@@ -596,6 +736,7 @@ def main() -> None:
     ap.add_argument("--roundtrips_csv", required=True)
     ap.add_argument("--prompt_dir", required=True)
     ap.add_argument("--backward_prompt_dir", default=None, help="Deprecated/ignored for evaluation; strict universal backward prompt is always used.")
+    ap.add_argument("--inventory_csv", default="meta_model/v0_union/source_element_inventory.csv", help="Optional Union V0/source inventory for static label metadata.")
     ap.add_argument("--model_config_yaml", required=True)
     ap.add_argument("--model_key", required=True)
     ap.add_argument("--output_dir", required=True)
@@ -615,6 +756,7 @@ def main() -> None:
     client = make_client(model_cfg)
     prompt_dir = Path(args.prompt_dir)
     backward_dir = Path(args.backward_prompt_dir) if args.backward_prompt_dir else None
+    label_lookup = load_label_lookup(Path(args.inventory_csv) if args.inventory_csv else None)
 
     base_out = Path(args.output_dir) / args.model_key
     base_out.mkdir(parents=True, exist_ok=True)
@@ -625,10 +767,11 @@ def main() -> None:
         "info_models": info_models,
         "roundtrips_csv": args.roundtrips_csv,
         "prompt_dir": args.prompt_dir,
+        "inventory_csv": args.inventory_csv,
         "backward_prompt_dir": args.backward_prompt_dir,
         "stage": args.stage,
         "backward_input": STRICT_POLICY,
-        "backward_prompt": "minimal_universal_annotation_only",
+        "backward_prompt": "universal_annotation_dictionary_relationships",
     }, indent=2))
 
     for info_model in info_models:
@@ -638,8 +781,8 @@ def main() -> None:
         backward_text = backward_path.read_text(errors="replace") if backward_path else None
         out_dir = base_out / info_model
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "prompt_files.json").write_text(json.dumps({"forward_prompt_file": str(prompt_path), "backward_prompt_file_deprecated_not_used": str(backward_path) if backward_path else None, "uses_universal_strict_backward_prompt": True, "backward_input_policy": STRICT_POLICY}, indent=2))
-        run_info_model(rows, client, model_cfg, info_model, prompt_text, backward_text, out_dir, args.stage)
+        (out_dir / "prompt_files.json").write_text(json.dumps({"forward_prompt_file": str(prompt_path), "backward_prompt_file_deprecated_not_used": str(backward_path) if backward_path else None, "uses_universal_structured_backward_prompt": True, "backward_input_policy": STRICT_POLICY}, indent=2))
+        run_info_model(rows, client, model_cfg, info_model, prompt_text, backward_text, out_dir, args.stage, label_lookup)
 
     print(f"Wrote individual-model outputs under {base_out}")
 
