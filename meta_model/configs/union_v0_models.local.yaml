@@ -1,6 +1,5 @@
 # Local Phase 1 model config.
-# Safe placeholder copy of union_v0_models_template.yaml.
-# Do not put API keys, bearer tokens, private endpoints, local model paths, or cluster paths in this file.
+# Do not commit API keys, bearer tokens, private endpoints, local model paths, or cluster paths.
 
 # model_key is the script/output key, for example medgemma, qwen235b, llama4_scout, or mayo_gpt55.
 # model is the exact model name sent to the API for OpenAI-compatible local servers.
@@ -40,12 +39,15 @@ models:
     deployment: gpt-5.5
     api_version: "2024-10-21"
     apigee_url: https://mcc.apix.mayo.edu
-    # Preferred for long runs: put the refreshed bearer token in this file.
-    # The Apigee wrapper reads this file on every request.
+    oauth_token_url: https://mcc.apix.mayo.edu/oauth/token
+    oauth_client_id_env: APIGEE_CLIENT_ID
+    oauth_client_secret_env: APIGEE_CLIENT_SECRET
+    # Optional fallback if you already have a refreshed bearer token.
     api_key_file_env: APIGEE_TOKEN_FILE
-    # Fallback for shorter runs: read bearer token directly from an environment variable.
     api_key_env: APIGEE_TOKEN
-    max_tokens: 4096
+    omit_temperature: true
+    top_p: 1
+    max_tokens: 8192
     timeout_seconds: 120
     max_retries: 6
     retry_sleep_seconds: 10
