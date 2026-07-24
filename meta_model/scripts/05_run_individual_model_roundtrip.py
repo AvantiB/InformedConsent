@@ -1,11 +1,9 @@
 #!/usr/bin/env python
 """Run individual source-model prompt round-trip experiments.
 
-Forward uses each original source-model prompt as the information-model specific
-schema, but adds a strict Phase 1 output contract around it: annotation labels
-should be copied verbatim from the source-model dictionary, reserved non-label
-strings are not valid annotation IDs, and sentence-level values must be
-controlled consent-force labels only.
+Primary Phase 1 individual-model runs use one universal forward prompt and only
+change the source-model data dictionary. This avoids confounding source-model
+coverage with legacy prompt formatting differences.
 
 Backward evaluation uses the same universal structured protocol as Union V0:
 valid span annotations enriched with static label metadata, sanitized
@@ -176,14 +174,52 @@ def load_rows(roundtrips_csv: Path, limit: int | None, no_dedupe_sentences: bool
     return out[["_source_id", "_source_text"]]
 
 
+def load_inventory(inventory_csv: Path) -> pd.DataFrame:
+    inv = pd.read_csv(inventory_csv).fillna("")
+    required = ["union_element_id", "source_model", "source_element_id", "source_element_label", "source_element_definition"]
+    missing = [c for c in required if c not in inv.columns]
+    if missing:
+        raise ValueError(f"Inventory missing required columns: {missing}")
+    if "element_scope" not in inv.columns:
+        inv["element_scope"] = "span"
+    return inv
+
+
+def source_model_aliases(info_model: str) -> set[str]:
+    return {info_model, info_model.replace("_Consent", ""), info_model.replace("_", "")}
+
+
+def inventory_for_info_model(inv: pd.DataFrame, info_model: str) -> pd.DataFrame:
+    aliases = {x.casefold() for x in source_model_aliases(info_model)}
+    sub = inv[inv["source_model"].astype(str).str.casefold().isin(aliases)].copy()
+    if sub.empty:
+        raise ValueError(f"No inventory rows found for info_model={info_model!r}. Check source_model values in inventory.")
+    return sub.reset_index(drop=True)
+
+
+def build_source_dictionary_text(inv: pd.DataFrame, info_model: str) -> str:
+    lines = [
+        f"Authoritative {info_model} source-model dictionary. Each row has:",
+        "source_element_id | source_element_label | source_element_definition | element_scope",
+        "Copy source_element_id and source_element_label verbatim into every annotation.",
+        "",
+    ]
+    for _, row in inv.iterrows():
+        scope = norm_text(row.get("element_scope", "span")) or "span"
+        lines.append(
+            f"- source_element_id={norm_text(row['source_element_id'])} | "
+            f"source_element_label={norm_text(row['source_element_label'])} | "
+            f"element_scope={scope} | "
+            f"source_element_definition={norm_text(row['source_element_definition'])}"
+        )
+    return "\n".join(lines)
+
+
 def load_label_lookup(inventory_csv: Path | None) -> dict[str, Any]:
     lookup: dict[str, Any] = {"by_info_key": {}, "by_info_label": {}, "metadata_by_union_id": {}}
     if inventory_csv is None or not inventory_csv.exists():
         return lookup
-    inv = pd.read_csv(inventory_csv).fillna("")
-    required = {"source_model", "source_element_id", "source_element_label", "source_element_definition", "union_element_id"}
-    if not required.issubset(set(inv.columns)):
-        return lookup
+    inv = load_inventory(inventory_csv)
     for _, row in inv.iterrows():
         source_model = norm_text(row["source_model"])
         union_id = norm_text(row["union_element_id"])
@@ -198,11 +234,9 @@ def load_label_lookup(inventory_csv: Path | None) -> dict[str, Any]:
             "label_definition": definition,
         }
         lookup["metadata_by_union_id"][union_id] = meta
-        aliases = {source_model, source_model.replace("_Consent", ""), source_model.replace("_", "")}
-        candidates = {union_id, source_id, label}
-        for alias in aliases:
+        for alias in source_model_aliases(source_model):
             alias_key = alias.casefold()
-            for cand in candidates:
+            for cand in {union_id, source_id, label}:
                 lookup["by_info_key"][(alias_key, norm_key(cand))] = meta
             lookup["by_info_label"].setdefault((alias_key, norm_key(label)), []).append(meta)
     return lookup
@@ -223,7 +257,6 @@ def resolve_label_metadata(label: str, info_model: str, lookup: dict[str, Any]) 
         meta = lookup.get("by_info_key", {}).get(key)
         if meta:
             return meta, "valid", "exact_inventory_match"
-    # Last safe rescue: exact label text uniquely identifies one row within this source model.
     candidates: list[dict[str, Any]] = []
     for alias in info_model_aliases(info_model):
         candidates.extend(lookup.get("by_info_label", {}).get((alias.casefold(), norm_key(label)), []))
@@ -293,36 +326,45 @@ def find_backward_prompt_file(backward_dir: Path | None, info_model: str) -> Pat
     return sorted(matches, key=lambda p: ("back" not in p.name.lower(), len(p.name), p.name.lower()))[0]
 
 
-def build_forward_messages(prompt_text: str, sentence: str) -> list[dict[str, str]]:
+def build_forward_messages(dictionary_text: str, info_model: str, sentence: str) -> list[dict[str, str]]:
     system = "You are an NLP annotator for informed-consent documents. Apply only the supplied source-model dictionary. Return valid JSON only."
     user = f"""
-Use the original source-model prompt below as the information-model schema, but follow the strict Phase 1 output contract.
+Task: annotate the informed-consent sentence using ONLY rows from the authoritative {info_model} dictionary below.
 
-Strict Phase 1 output contract:
-- Return JSON only.
-- Every span annotation must copy a source-model element ID or label exactly from the source-model prompt/dictionary.
-- When available, include both source_element_id and source_element_label copied verbatim from the same source-model row.
+Design rule:
+- The forward prompt is identical across individual source-model experiments; only the dictionary changes.
+- Do not use concepts from any other information model.
+
+Hard dictionary rules:
+- Every span annotation MUST copy source_element_id exactly from one dictionary row.
+- Every span annotation MUST copy source_element_label exactly from the same dictionary row.
 - Do not invent IDs, labels, fields, or namespaces.
-- Never use reserved non-label strings as annotation IDs or labels: unmatched_language, unmatched, no_match, none, null, unknown, invalid, n/a.
-- unmatched_language is only the name of the top-level audit list. It is never a valid annotation label.
-- If no source-model dictionary row fits, place the phrase only in top-level unmatched_language and do not create an annotation object for it.
+- Never use reserved non-label strings as source_element_id or source_element_label: unmatched_language, unmatched, no_match, none, null, unknown, invalid, n/a.
+- unmatched_language is only the name of the top-level audit list. It is never a dictionary label and never a valid annotation.
+- If no dictionary row fits, put the phrase only in top-level unmatched_language and do not create an annotation object for it.
 - A phrase may be annotated with a general source-model class even when the phrase is a named instance and the exact phrase is not in the dictionary.
 - Do not annotate standalone “yes” or “no” as Permission or Prohibition unless it directly governs a specific action. Phrases like “say yes or no” represent choice/decision, not permit plus prohibit.
 - Phrases like “no penalty” and “no expiration date” are not sentence-level denial/prohibition; they are consequence/protection or temporal-scope expressions.
-- sentence_decision must be one of: permit, deny, mixed, unclear.
-- sentence_level_elements.value must be a controlled decision value only, e.g., permit, deny, mixed, unclear, Permission, Prohibition, Duty. Do not write explanatory summaries in sentence_level_elements.value.
 
-Return JSON with this structure when possible:
+Sentence-level rules:
+- sentence_decision must be one of: permit, deny, mixed, unclear.
+- sentence_level_elements.value must be a controlled decision value only, e.g., permit, deny, mixed, unclear, Permission, Prohibition, Duty.
+- Do not write explanatory summaries in sentence_level_elements.value.
+- Use sentence_level_elements only for dictionary rows that are sentence-level governance/decision fields.
+
+Data dictionary:
+{dictionary_text}
+
+Return JSON with exactly this structure:
 {{
   "sentence_decision": "permit|deny|mixed|unclear",
-  "sentence_level_elements": [{{"source_element_id": "exact source ID", "source_element_label": "exact source label", "value": "controlled decision value only"}}],
+  "sentence_level_elements": [{{"source_element_id": "exact dictionary source_element_id", "source_element_label": "exact dictionary source_element_label", "value": "controlled decision value only"}}],
   "annotations": [
     {{
       "annotation_id": "a1",
       "span_text": "exact text span",
-      "source_element_id": "exact source-model element ID if available",
-      "source_element_label": "exact source-model element label if available",
-      "label": "same as source_element_label if no separate field is required",
+      "source_element_id": "exact dictionary source_element_id",
+      "source_element_label": "exact dictionary source_element_label",
       "overlap_group_id": "g1 or null",
       "span_relation": "single|same_span|broader_span|narrower_nested_span|partially_overlapping_span",
       "decision_or_polarity": "controlled local value if explicitly supported, else empty",
@@ -343,10 +385,7 @@ Return JSON with this structure when possible:
   "unmatched_language": [{{"span_text": "exact text span", "reason": "brief reason"}}]
 }}
 
-Original source-model prompt:
-{prompt_text}
-
-Sentence to annotate:
+Sentence:
 {sentence}
 """.strip()
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -432,7 +471,6 @@ def get_span_value(d: dict[str, Any]) -> str:
 
 
 def get_label_value(d: dict[str, Any], span: str = "") -> str:
-    # Prefer explicit source ID, then explicit source label, then legacy label-like fields.
     for key in LABEL_KEYS:
         value = norm_text(d.get(key))
         if value and value != span and key not in SPAN_KEYS:
@@ -442,14 +480,6 @@ def get_label_value(d: dict[str, Any], span: str = "") -> str:
 
 def get_label_name_value(d: dict[str, Any]) -> str:
     return first_value(d, ["source_element_label", "label_name", "label", "field_name", "element", "term", "class", "category", "role", "type"])
-
-
-def get_decision_value(d: dict[str, Any]) -> str:
-    for key in DECISION_KEYS:
-        value = normalize_sentence_decision_value(d.get(key))
-        if value:
-            return value
-    return ""
 
 
 def normalize_sentence_decision_value(value: Any) -> str:
@@ -472,6 +502,14 @@ def normalize_sentence_decision_value(value: Any) -> str:
         return "mixed"
     if low in {"unclear", "unknown", "not clear", "ambiguous"}:
         return "unclear"
+    return ""
+
+
+def get_decision_value(d: dict[str, Any]) -> str:
+    for key in DECISION_KEYS:
+        value = normalize_sentence_decision_value(d.get(key))
+        if value:
+            return value
     return ""
 
 
@@ -658,6 +696,9 @@ def parse_span_annotations(raw_forward: str, source_text: str, info_model: str, 
         "n_annotations_routed_to_unmatched": len(routed),
         "n_annotations_backward_eligible_strict": len(valid),
         "n_full_sentence_spans_dropped": dropped_full_sentence,
+        "na_only_annotation_row": len(valid) == 0,
+        "exclude_from_schema_induction": len(valid) == 0,
+        "exclude_reason": "NA-only/deferred/no valid span annotation evidence" if len(valid) == 0 else "",
     }
     return valid, audit, invalid, routed, unmatched
 
@@ -930,6 +971,9 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
             "n_sentence_level_annotations_backward_eligible": audit.get("n_sentence_level_annotations_backward_eligible", ""),
             "n_sentence_level_elements_dropped_by_policy": audit.get("n_sentence_level_elements_dropped_by_policy", ""),
             "n_full_sentence_spans_dropped": audit.get("n_full_sentence_spans_dropped", ""),
+            "na_only_annotation_row": audit.get("na_only_annotation_row", len(items) == 0),
+            "exclude_from_schema_induction": audit.get("exclude_from_schema_induction", len(items) == 0),
+            "exclude_reason": audit.get("exclude_reason", ""),
             "annotation_parse_mode": audit.get("annotation_parse_mode", ""),
             "forward_parse_ok": bool(items) or bool(f.get("raw_response", "")),
             "backward_parse_ok": b.get("parse_ok", False),
@@ -939,7 +983,7 @@ def write_csv(forward_path: Path, backward_path: Path, out_csv: Path) -> None:
     pd.DataFrame(rows).to_csv(out_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 
 
-def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], info_model: str, prompt_text: str, backward_prompt_text: str | None, out_dir: Path, stage: str, label_lookup: dict[str, Any] | None = None) -> None:
+def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any], info_model: str, dictionary_text: str, backward_prompt_text: str | None, out_dir: Path, stage: str, label_lookup: dict[str, Any] | None = None) -> None:
     _ = backward_prompt_text
     label_lookup = label_lookup or {}
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -955,7 +999,7 @@ def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any]
                 continue
             sentence = row["_source_text"]
             try:
-                raw = call_chat(client, model_cfg, build_forward_messages(prompt_text, sentence))
+                raw = call_chat(client, model_cfg, build_forward_messages(dictionary_text, info_model, sentence))
                 append_jsonl(forward_path, {"source_id": source_id, "source_text": sentence, "model_key": model_cfg["model_key"], "model": model_cfg["model"], "info_model": info_model, "stage": "forward", "raw_response": raw})
                 done.add(source_id)
                 print(f"[{info_model} forward] {i + 1}/{len(rows)} ok {source_id}")
@@ -994,9 +1038,9 @@ def run_info_model(rows: pd.DataFrame, client: OpenAI, model_cfg: dict[str, Any]
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--roundtrips_csv", required=True)
-    ap.add_argument("--prompt_dir", required=True)
+    ap.add_argument("--prompt_dir", default=None, help="Deprecated/reference only. Primary Phase 1 uses universal dictionary-based prompts.")
     ap.add_argument("--backward_prompt_dir", default=None, help="Deprecated/ignored for evaluation; strict universal backward prompt is always used.")
-    ap.add_argument("--inventory_csv", default="meta_model/v0_union/source_element_inventory.csv", help="Optional Union V0/source inventory for static label metadata.")
+    ap.add_argument("--inventory_csv", default="meta_model/v0_union/source_element_inventory.csv", help="Union/source inventory used as authoritative per-model dictionary.")
     ap.add_argument("--model_config_yaml", required=True)
     ap.add_argument("--model_key", required=True)
     ap.add_argument("--output_dir", required=True)
@@ -1014,9 +1058,10 @@ def main() -> None:
     rows = load_rows(Path(args.roundtrips_csv), args.limit, args.no_dedupe_sentences)
     model_cfg = load_model_config(Path(args.model_config_yaml), args.model_key)
     client = make_client(model_cfg)
-    prompt_dir = Path(args.prompt_dir)
+    inventory_csv = Path(args.inventory_csv)
+    inv = load_inventory(inventory_csv)
+    label_lookup = load_label_lookup(inventory_csv)
     backward_dir = Path(args.backward_prompt_dir) if args.backward_prompt_dir else None
-    label_lookup = load_label_lookup(Path(args.inventory_csv) if args.inventory_csv else None)
 
     base_out = Path(args.output_dir) / args.model_key
     base_out.mkdir(parents=True, exist_ok=True)
@@ -1026,32 +1071,36 @@ def main() -> None:
         "n_input_rows": int(len(rows)),
         "info_models": info_models,
         "roundtrips_csv": args.roundtrips_csv,
-        "prompt_dir": args.prompt_dir,
+        "prompt_dir_deprecated_reference_only": args.prompt_dir,
         "inventory_csv": args.inventory_csv,
         "backward_prompt_dir_deprecated_not_used": args.backward_prompt_dir,
         "stage": args.stage,
-        "prompt_design": "source_model_forward_requires_verbatim_id_label_and_controlled_sentence_decisions",
+        "prompt_design": "universal_forward_prompt_with_source_model_dictionary_only",
         "id_validation": "source_model_inventory_label_validation_with_reserved_non_label_routing",
         "sentence_level_backward_policy": "controlled_decision_values_only_no_explanatory_summaries",
+        "zero_annotation_policy": "no_backward_llm_call_and_exclude_from_schema_induction",
         "backward_input": STRICT_POLICY,
         "backward_prompt": "universal_annotation_dictionary_relationships",
     }, indent=2))
 
     for info_model in info_models:
-        prompt_path = find_prompt_file(prompt_dir, info_model)
+        source_inv = inventory_for_info_model(inv, info_model)
+        dictionary_text = build_source_dictionary_text(source_inv, info_model)
         backward_path = find_backward_prompt_file(backward_dir, info_model)
-        prompt_text = prompt_path.read_text(errors="replace")
         backward_text = backward_path.read_text(errors="replace") if backward_path else None
         out_dir = base_out / info_model
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "prompt_files.json").write_text(json.dumps({
-            "forward_prompt_file": str(prompt_path),
+            "legacy_forward_prompt_file_deprecated_not_used": str(find_prompt_file(Path(args.prompt_dir), info_model)) if args.prompt_dir else None,
             "backward_prompt_file_deprecated_not_used": str(backward_path) if backward_path else None,
+            "uses_universal_dictionary_forward_prompt": True,
             "uses_universal_structured_backward_prompt": True,
+            "dictionary_source_model": info_model,
+            "dictionary_rows": int(len(source_inv)),
             "backward_input_policy": STRICT_POLICY,
             "strict_forward_contract_applied": True,
         }, indent=2))
-        run_info_model(rows, client, model_cfg, info_model, prompt_text, backward_text, out_dir, args.stage, label_lookup)
+        run_info_model(rows, client, model_cfg, info_model, dictionary_text, backward_text, out_dir, args.stage, label_lookup)
 
     print(f"Wrote individual-model outputs under {base_out}")
 
