@@ -1,25 +1,35 @@
 # Phase 1 strict round-trip completion runbook
 
-This runbook supersedes legacy prompt-specific Phase 1 instructions.
+This runbook is the current paper-facing Phase 1 instruction set.
 
 ## Core design
 
 Phase 1 uses a constant forward/backward protocol so that differences reflect the information model/dictionary, not prompt wording.
 
+Sentence-level consent force is **not** an annotation label and is **not** an information-model element for Phase 1 evaluation. Fields such as `FHIR_Consent::Consent.provision.type` and `ODRL::Rule_TestSentence` are removed from the annotation dictionaries and are not allowed as span labels. Their allowed values are represented only through the universal top-level field:
+
+```text
+sentence_decision = permit | deny | mixed | unclear
+```
+
+Backward reconstruction may receive this controlled `sentence_decision` only when valid span annotations exist.
+
+## Scripts to use
+
+Use the Phase 1 wrapper scripts below, not the legacy entry points, for the final Phase 1 runs.
+
 ### Union V0
 
-- Script: `meta_model/scripts/03_run_union_v0_roundtrip.py`
-- Mayo GPT/Apigee wrapper: `meta_model/scripts/12_run_union_v0_roundtrip_apigee.py`
-- Forward prompt: universal Union V0 dictionary prompt
-- Dictionary: all rows in `meta_model/v0_union/source_element_inventory.csv`
+- Local/vLLM script: `meta_model/scripts/42_run_phase1_union_v0_roundtrip.py`
+- Mayo GPT/Apigee script: `meta_model/scripts/43_run_phase1_union_v0_roundtrip_apigee.py`
+- Dictionary: all non-sentence-level rows in `meta_model/v0_union/source_element_inventory.csv`
 
 ### Individual source models
 
-- Script: `meta_model/scripts/05_run_individual_model_roundtrip.py`
-- Mayo GPT/Apigee wrapper: `meta_model/scripts/13_run_individual_model_roundtrip_apigee.py`
-- Forward prompt: one universal source-model prompt
-- Dictionary: `source_element_inventory.csv` filtered to one source model at a time
-- `--prompt_dir` is deprecated/reference-only and is not used for primary Phase 1 forward prompting.
+- Local/vLLM script: `meta_model/scripts/44_run_phase1_individual_roundtrip.py`
+- Mayo GPT/Apigee script: `meta_model/scripts/45_run_phase1_individual_roundtrip_apigee.py`
+- Dictionary: non-sentence-level rows from `source_element_inventory.csv`, filtered to one source model at a time
+- `--prompt_dir` is deprecated/reference-only and is not used for primary Phase 1 prompting.
 
 ### Backward prompt for all conditions
 
@@ -28,7 +38,7 @@ All Phase 1 conditions use the same universal backward prompt. Backward reconstr
 - valid span annotations
 - static label metadata/definitions
 - sanitized relationship links
-- controlled sentence-level decisions
+- the controlled universal `sentence_decision`, when valid span evidence exists
 
 Backward reconstruction does not receive:
 
@@ -39,6 +49,7 @@ Backward reconstruction does not receive:
 - backward mapping decisions
 - rationales
 - raw forward responses
+- source-model-specific sentence-level label rows
 
 Rows with no valid span annotation evidence are not sent to the backward LLM. They receive a blank reconstruction and are flagged as excluded from schema induction.
 
@@ -46,16 +57,83 @@ Rows with no valid span annotation evidence are not sent to the backward LLM. Th
 
 ```bash
 python -m py_compile \
-  meta_model/scripts/03_run_union_v0_roundtrip.py \
-  meta_model/scripts/05_run_individual_model_roundtrip.py \
-  meta_model/scripts/12_run_union_v0_roundtrip_apigee.py \
-  meta_model/scripts/13_run_individual_model_roundtrip_apigee.py \
+  meta_model/scripts/42_run_phase1_union_v0_roundtrip.py \
+  meta_model/scripts/43_run_phase1_union_v0_roundtrip_apigee.py \
+  meta_model/scripts/44_run_phase1_individual_roundtrip.py \
+  meta_model/scripts/45_run_phase1_individual_roundtrip_apigee.py \
   meta_model/scripts/41_filter_phase1_outputs_for_schema_induction.py
 ```
 
-## Union V0 full runs
+## Smoke tests
 
-Local/vLLM models:
+Union V0 local model:
+
+```bash
+export PHASE1_SMOKE=meta_model/phase1_smoke/final_sentence_decision_policy
+export MODEL_KEY=medgemma
+
+rm -rf "$PHASE1_SMOKE/union_v0/$MODEL_KEY"
+
+python meta_model/scripts/42_run_phase1_union_v0_roundtrip.py \
+  --roundtrips_csv "$ROUNDTRIPS_CSV" \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv \
+  --model_config_yaml "$MODEL_CONFIG" \
+  --model_key "$MODEL_KEY" \
+  --output_dir "$PHASE1_SMOKE/union_v0" \
+  --stage both \
+  --limit 10
+```
+
+Individual source models local model:
+
+```bash
+export PHASE1_SMOKE=meta_model/phase1_smoke/final_sentence_decision_policy
+export MODEL_KEY=medgemma
+
+rm -rf "$PHASE1_SMOKE/individual/$MODEL_KEY"
+
+python meta_model/scripts/44_run_phase1_individual_roundtrip.py \
+  --roundtrips_csv "$ROUNDTRIPS_CSV" \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv \
+  --model_config_yaml "$MODEL_CONFIG" \
+  --model_key "$MODEL_KEY" \
+  --output_dir "$PHASE1_SMOKE/individual" \
+  --info_models all \
+  --stage both \
+  --limit 10
+```
+
+Mayo GPT/Apigee equivalents:
+
+```bash
+export PHASE1_SMOKE=meta_model/phase1_smoke/final_sentence_decision_policy
+export MODEL_KEY=mayo_gpt55
+
+rm -rf "$PHASE1_SMOKE/union_v0/$MODEL_KEY"
+python meta_model/scripts/43_run_phase1_union_v0_roundtrip_apigee.py \
+  --roundtrips_csv "$ROUNDTRIPS_CSV" \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv \
+  --model_config_yaml "$MODEL_CONFIG" \
+  --model_key "$MODEL_KEY" \
+  --output_dir "$PHASE1_SMOKE/union_v0" \
+  --stage both \
+  --limit 10
+
+rm -rf "$PHASE1_SMOKE/individual/$MODEL_KEY"
+python meta_model/scripts/45_run_phase1_individual_roundtrip_apigee.py \
+  --roundtrips_csv "$ROUNDTRIPS_CSV" \
+  --inventory_csv meta_model/v0_union/source_element_inventory.csv \
+  --model_config_yaml "$MODEL_CONFIG" \
+  --model_key "$MODEL_KEY" \
+  --output_dir "$PHASE1_SMOKE/individual" \
+  --info_models all \
+  --stage both \
+  --limit 10
+```
+
+## Full Phase 1 runs
+
+Union V0 local/vLLM models:
 
 ```bash
 export PHASE1_ROOT=meta_model/phase1_strict
@@ -63,7 +141,7 @@ export PHASE1_ROOT=meta_model/phase1_strict
 for MODEL_KEY in medgemma qwen235b llama4_scout; do
   rm -rf "$PHASE1_ROOT/union_v0/$MODEL_KEY"
 
-  python meta_model/scripts/03_run_union_v0_roundtrip.py \
+  python meta_model/scripts/42_run_phase1_union_v0_roundtrip.py \
     --roundtrips_csv "$ROUNDTRIPS_CSV" \
     --inventory_csv meta_model/v0_union/source_element_inventory.csv \
     --model_config_yaml "$MODEL_CONFIG" \
@@ -74,7 +152,7 @@ for MODEL_KEY in medgemma qwen235b llama4_scout; do
 done
 ```
 
-Mayo GPT/Apigee:
+Union V0 Mayo GPT/Apigee:
 
 ```bash
 export PHASE1_ROOT=meta_model/phase1_strict
@@ -82,7 +160,7 @@ export MODEL_KEY=mayo_gpt55
 
 rm -rf "$PHASE1_ROOT/union_v0/$MODEL_KEY"
 
-python meta_model/scripts/12_run_union_v0_roundtrip_apigee.py \
+python meta_model/scripts/43_run_phase1_union_v0_roundtrip_apigee.py \
   --roundtrips_csv "$ROUNDTRIPS_CSV" \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
   --model_config_yaml "$MODEL_CONFIG" \
@@ -91,9 +169,7 @@ python meta_model/scripts/12_run_union_v0_roundtrip_apigee.py \
   --stage both
 ```
 
-## Individual source-model full runs
-
-Local/vLLM models:
+Individual source-model local/vLLM models:
 
 ```bash
 export PHASE1_ROOT=meta_model/phase1_strict
@@ -101,7 +177,7 @@ export PHASE1_ROOT=meta_model/phase1_strict
 for MODEL_KEY in medgemma qwen235b llama4_scout; do
   rm -rf "$PHASE1_ROOT/individual/$MODEL_KEY"
 
-  python meta_model/scripts/05_run_individual_model_roundtrip.py \
+  python meta_model/scripts/44_run_phase1_individual_roundtrip.py \
     --roundtrips_csv "$ROUNDTRIPS_CSV" \
     --inventory_csv meta_model/v0_union/source_element_inventory.csv \
     --model_config_yaml "$MODEL_CONFIG" \
@@ -113,7 +189,7 @@ for MODEL_KEY in medgemma qwen235b llama4_scout; do
 done
 ```
 
-Mayo GPT/Apigee:
+Individual source-model Mayo GPT/Apigee:
 
 ```bash
 export PHASE1_ROOT=meta_model/phase1_strict
@@ -121,7 +197,7 @@ export MODEL_KEY=mayo_gpt55
 
 rm -rf "$PHASE1_ROOT/individual/$MODEL_KEY"
 
-python meta_model/scripts/13_run_individual_model_roundtrip_apigee.py \
+python meta_model/scripts/45_run_phase1_individual_roundtrip_apigee.py \
   --roundtrips_csv "$ROUNDTRIPS_CSV" \
   --inventory_csv meta_model/v0_union/source_element_inventory.csv \
   --model_config_yaml "$MODEL_CONFIG" \
@@ -172,6 +248,8 @@ banned = [
     'rationale',
     'raw_response',
     'original_sentence',
+    'Consent.provision.type',
+    'Rule_TestSentence',
 ]
 
 for csv_path in sorted(Path('meta_model/phase1_strict').glob('**/*roundtrip_outputs.csv')):
