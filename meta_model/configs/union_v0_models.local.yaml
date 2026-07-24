@@ -1,0 +1,51 @@
+# Local Phase 1 model config.
+# Safe placeholder copy of union_v0_models_template.yaml.
+# Do not put API keys, bearer tokens, private endpoints, local model paths, or cluster paths in this file.
+
+# model_key is the script/output key, for example medgemma, qwen235b, llama4_scout, or mayo_gpt55.
+# model is the exact model name sent to the API for OpenAI-compatible local servers.
+# For vLLM, model must exactly match --served-model-name.
+
+defaults:
+  api_type: chat_completions
+  temperature: 0
+  max_tokens: 4096
+  timeout_seconds: 120
+  max_retries: 3
+  retry_sleep_seconds: 5
+
+models:
+  medgemma:
+    provider: openai_compatible
+    model: medgemma
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: VLLM_API_KEY
+
+  qwen235b:
+    provider: openai_compatible
+    model: qwen235b
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: VLLM_API_KEY
+
+  llama4_scout:
+    provider: openai_compatible
+    # Change this locally if your vLLM --served-model-name differs.
+    model: meta-llama/Llama-4-Scout-17B-16E-Instruct
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: VLLM_API_KEY
+
+  mayo_gpt55:
+    provider: mayo_apigee_azure_openai
+    model: gpt-5.5
+    deployment: gpt-5.5
+    api_version: "2024-10-21"
+    apigee_url: https://mcc.apix.mayo.edu
+    # Preferred for long runs: put the refreshed bearer token in this file.
+    # The Apigee wrapper reads this file on every request.
+    api_key_file_env: APIGEE_TOKEN_FILE
+    # Fallback for shorter runs: read bearer token directly from an environment variable.
+    api_key_env: APIGEE_TOKEN
+    max_tokens: 4096
+    timeout_seconds: 120
+    max_retries: 6
+    retry_sleep_seconds: 10
