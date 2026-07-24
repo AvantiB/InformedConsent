@@ -5,6 +5,11 @@ The Direct LLM arm is deliberately conservative: it starts from governed/expert
 source-model dictionaries plus optional requirements guidance and training-fold
 example sentences. It should stay close to DUO, ICO, ODRL, and FHIR Consent.
 The more exploratory arm is the later data-driven + LLM induction pipeline.
+
+The induced schema is required to be round-trip ready: its output includes a flat
+field dictionary, controlled modifiers, a forward annotation contract, and a
+source-model crosswalk so it can be converted directly into a forward-mapping
+schema for round-trip evaluation.
 """
 from __future__ import annotations
 
@@ -133,11 +138,11 @@ def build_messages(payload: dict[str, Any], granularity: str) -> list[dict[str, 
     payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
     system = "You design conservative, machine-interpretable informed-consent schemas. Return valid JSON only."
     user = f"""
-Task: create a {granularity}-granularity reduced informed-consent meta-model as a flat dictionary.
+Task: create a {granularity}-granularity reduced informed-consent meta-model that can be used directly for forward annotation and annotation-only backward reconstruction.
 
 Use these inputs:
 1. DUO, ICO, ODRL, and FHIR Consent dictionary rows.
-2. Requirements/guidance text, if present.
+2. Requirements/guidance pointers, if present.
 3. Representative training-fold consent sentences.
 
 Design priorities:
@@ -146,12 +151,21 @@ Design priorities:
 - Keep distinct functional roles separate when merging would lose meaning.
 - Use requirements/guidance only to identify coverage needs and boundary cases.
 - Do not copy guideline headings as field names.
-- Do not treat sentence-level decision fields as annotation labels.
 - Keep sentence_decision separate from span-level fields.
-- The schema must support faithful machine-interpretable representation of permissions, prohibitions, restrictions, obligations, temporal logic, conditions, identifiability, sharing, withdrawal, and consequences/protections.
-- Prefer a flat span-level dictionary. Add modifiers only when they prevent unnecessary field proliferation or preserve required meaning.
 - Target {target_min}-{target_max} span-level fields.
-- Do not invent new fields unless a source-model-grounded field cannot represent a requirement; mark any such field as requirement_driven_extension and justify it.
+- Prefer a flat span-level dictionary.
+- Allow modifiers only when a controlled modifier is necessary for faithful representation and avoids unnecessary field proliferation.
+- Do not invent new fields unless no source-model-grounded field can represent a necessary requirement; mark any such field as requirement_driven_extension and justify it.
+
+Round-trip implementation constraints:
+- Every field must be usable as a dictionary row in a forward annotation prompt.
+- field_id must be stable, unique, short, and copied verbatim during annotation.
+- field_name must be snake_case and copied verbatim during annotation.
+- Field definitions must be specific enough for an annotator to choose spans without extra ontology context.
+- Modifiers must be controlled key-value attributes attached to annotations, not separate span labels.
+- Each modifier must list allowed_values and the fields it can attach to.
+- Do not require nested frames for this arm; this schema must remain usable as a flat dictionary plus optional modifiers.
+- The output must include dictionary_rows that can be converted directly to CSV for the forward round-trip runner.
 
 Return JSON exactly in this structure:
 {{
@@ -163,12 +177,26 @@ Return JSON exactly in this structure:
     "description": "Universal sentence/provision-level consent force, not an annotation label.",
     "allowed_values": ["permit", "deny", "mixed", "unclear"]
   }},
+  "forward_annotation_contract": {{
+    "prompt_dictionary_columns": ["field_id", "field_name", "definition", "include", "exclude", "allowed_modifiers"],
+    "required_forward_json_keys": ["sentence_decision", "annotations", "interpretation_units"],
+    "annotation_object": {{
+      "annotation_id": "a1",
+      "span_text": "exact text span",
+      "field_id": "exact schema field_id",
+      "field_name": "exact schema field_name",
+      "modifiers": [{{"modifier_name": "exact modifier_name", "value": "allowed value"}}],
+      "overlap_group_id": "g1 or null",
+      "span_relation": "single|same_span|broader_span|narrower_nested_span|partially_overlapping_span"
+    }},
+    "backward_packet_policy": "Use only valid annotation spans, static field definitions, controlled modifiers, sanitized relationship links, and sentence_decision."
+  }},
   "fields": [
     {{
       "field_id": "DRS001",
       "field_name": "snake_case_name",
       "status": "core|extension",
-      "definition": "machine-interpretable definition",
+      "definition": "machine-interpretable definition for selecting spans",
       "include": ["what belongs here"],
       "exclude": ["boundary exclusions"],
       "source_model_support": [
@@ -180,15 +208,29 @@ Return JSON exactly in this structure:
         }}
       ],
       "requirement_basis": ["brief requirement/guidance basis if any"],
+      "requirement_driven_extension": false,
       "allowed_modifiers": ["modifier_name if applicable"],
-      "machine_representation_notes": "how to encode this field in annotation"
+      "annotation_guidance": "specific guidance for forward span annotation",
+      "machine_representation_notes": "how this field should appear in forward annotations"
+    }}
+  ],
+  "dictionary_rows": [
+    {{
+      "field_id": "DRS001",
+      "field_name": "snake_case_name",
+      "definition": "same final field definition",
+      "status": "core|extension",
+      "include": ["..."],
+      "exclude": ["..."],
+      "allowed_modifiers": ["modifier_name if applicable"],
+      "annotation_guidance": "specific guidance for forward annotation"
     }}
   ],
   "modifiers": [
     {{
       "modifier_id": "MOD001",
       "modifier_name": "snake_case_modifier",
-      "definition": "...",
+      "definition": "controlled annotation attribute, not a span label",
       "allowed_values": ["..."],
       "applies_to_fields": ["field_name or all"],
       "source_or_requirement_basis": ["..."],
@@ -244,6 +286,7 @@ def induce_one(input_json: Path, output_dir: Path, granularity: str, client: Any
         "provider": cfg.get("provider"),
         "granularity": granularity,
         "fold_id": fold_id,
+        "schema_design": "roundtrip_ready_flat_dictionary_with_optional_controlled_modifiers",
     }
     (out_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2))
     print(f"Wrote {out_dir / 'schema.json'}", flush=True)
