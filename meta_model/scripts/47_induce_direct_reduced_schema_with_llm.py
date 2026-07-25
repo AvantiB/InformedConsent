@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 """Induce direct, source-model-grounded reduced consent schemas with one LLM.
 
-This direct arm is conservative and round-trip oriented. The generated schema is a
-flat annotation dictionary plus optional controlled modifiers. It is intentionally
-compact so GPT-5.5 does not spend the full completion budget on hidden reasoning
-or verbose JSON.
+This direct arm asks the induction model to synthesize a model-agnostic informed
+consent meta-model from four source information-model dictionaries plus training
+fold example sentences. No external requirements guidance is used in this direct
+arm. The generated schema is a flat annotation dictionary plus optional
+model-chosen controlled modifiers so it can be evaluated by round-trip mapping.
 """
 from __future__ import annotations
 
@@ -27,7 +28,6 @@ try:
 except ImportError:
     OpenAI = None  # type: ignore
 
-MAX_GUIDANCE_CHARS = 5000
 MAX_SENTENCES = 25
 MAX_SENTENCE_CHARS = 260
 MAX_DICT_DEF_CHARS = 220
@@ -131,7 +131,7 @@ def granularity_targets(granularity: str) -> tuple[int, int]:
     if granularity == "low":
         return 10, 15
     if granularity == "high":
-        return 22, 30
+        return 22, 32
     raise ValueError("granularity must be high or low")
 
 
@@ -149,14 +149,6 @@ def compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
             })
         compact_dicts[str(model)] = compact_rows
 
-    guidance_parts = []
-    for g in payload.get("requirements_guidance") or []:
-        if isinstance(g, dict):
-            guidance_parts.append(trunc(g.get("text", ""), MAX_GUIDANCE_CHARS))
-        else:
-            guidance_parts.append(trunc(g, MAX_GUIDANCE_CHARS))
-    guidance_text = trunc("\n\n".join([p for p in guidance_parts if p]), MAX_GUIDANCE_CHARS)
-
     sentences = []
     for s in (payload.get("representative_training_sentences") or [])[:MAX_SENTENCES]:
         if isinstance(s, dict):
@@ -166,9 +158,8 @@ def compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "fold_id": payload.get("fold_id"),
-        "policy": "Conservative source-model-grounded flat dictionary; use NIH summary only as coverage pointers.",
+        "policy": "Direct induction from four source information-model dictionaries plus training-fold consent sentences only. No external guidance.",
         "source_model_dictionaries": compact_dicts,
-        "requirements_guidance_summary": guidance_text,
         "representative_training_sentences": sentences,
     }
 
@@ -178,13 +169,14 @@ def build_messages(payload: dict[str, Any], granularity: str) -> list[dict[str, 
     payload_text = json.dumps(compact_payload(payload), ensure_ascii=False, separators=(",", ":"))
     system = "Create compact JSON annotation schemas. Return JSON only. No prose."
     user = f"""
-Create a {granularity}-granularity reduced informed-consent annotation dictionary.
+Create a {granularity}-granularity, model-agnostic informed-consent meta-model.
 
-Goal: conservative merge of DUO/ICO/ODRL/FHIR span-level elements for round-trip annotation.
-Target {target_min}-{target_max} fields.
+Input: DUO, ICO, ODRL, and FHIR Consent dictionary rows plus representative training-fold consent sentences.
+Goal: synthesize one comprehensive meta-schema that harmonizes and standardizes the important consent elements represented across the four information models and can annotate the breadth of informed-consent language in the examples.
+Target {target_min}-{target_max} span-level fields.
 Keep sentence_decision separate with values permit, deny, mixed, unclear.
-Flat dictionary only. Modifiers are optional controlled attributes attached to annotations, not labels.
-Use NIH guidance only as coverage checks, not field names.
+Use a flat annotation dictionary. You may create modifiers if they help preserve meaning, but choose modifier names and allowed values yourself.
+Do not use external requirements or guideline concepts. Do not copy one source model's structure wholesale. Merge near-equivalent concepts, but keep distinctions needed for high-coverage annotation and round-trip reconstruction.
 
 Output compact JSON exactly with these keys:
 {{
@@ -207,15 +199,15 @@ Output compact JSON exactly with these keys:
    "allowed_values":["value1","value2"],
    "applies_to_fields":["field_name or all"]
  }}],
- "requirements_coverage":[{{"requirement":"short name","covered_by":["field_or_modifier"]}}],
+ "source_model_coverage":[{{"source_model":"DUO|ICO|ODRL|FHIR_Consent","coverage_note":"brief note"}}],
  "expert_review_flags":["brief flags"]
 }}
 
 Constraints:
-- No duplicate fields array; dictionary_rows is the field dictionary.
+- dictionary_rows is the only field dictionary.
 - No full source crosswalk.
 - Max 8 source_support strings per field.
-- Max 8 modifiers total.
+- Max 10 modifiers total.
 - Definitions must be annotation-ready, not conceptual essays.
 - Field IDs must be unique and stable.
 - Do not include rationale paragraphs.
@@ -249,8 +241,9 @@ def induce_one(input_json: Path, output_dir: Path, granularity: str, client: Any
         "provider": cfg.get("provider"),
         "granularity": granularity,
         "fold_id": fold_id,
-        "schema_design": "compact_roundtrip_ready_flat_dictionary_with_optional_controlled_modifiers",
+        "schema_design": "direct_model_agnostic_information_model_harmonization_flat_dictionary",
         "write_prompts_only": bool(write_prompts_only),
+        "external_guidance_used": False,
     }
     write_prompt_files(out_dir, messages, metadata)
     if write_prompts_only:
