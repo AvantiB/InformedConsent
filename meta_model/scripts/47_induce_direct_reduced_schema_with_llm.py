@@ -225,19 +225,22 @@ Input:{payload_text}
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def induce_one(input_json: Path, output_dir: Path, granularity: str, client: Any, cfg: dict[str, Any]) -> None:
+def write_prompt_files(out_dir: Path, messages: list[dict[str, str]], metadata: dict[str, Any]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = out_dir / "prompt_messages.json"
+    prompt_txt_path = out_dir / "browser_prompt.txt"
+    prompt_path.write_text(json.dumps(messages, ensure_ascii=False, indent=2))
+    prompt_txt_path.write_text("\n\n".join([f"[{m['role'].upper()}]\n{m['content']}" for m in messages]))
+    (out_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2))
+    print(f"Wrote {prompt_path}", flush=True)
+    print(f"Wrote {prompt_txt_path}", flush=True)
+
+
+def induce_one(input_json: Path, output_dir: Path, granularity: str, client: Any, cfg: dict[str, Any], write_prompts_only: bool) -> None:
     payload = json.loads(input_json.read_text())
     fold_id = payload.get("fold_id", input_json.parent.name)
     out_dir = output_dir / str(fold_id) / granularity
-    out_dir.mkdir(parents=True, exist_ok=True)
     messages = build_messages(payload, granularity)
-    (out_dir / "prompt_messages.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2))
-    raw = call_chat(client, cfg, messages)
-    (out_dir / "raw_response.txt").write_text(raw)
-    parsed = extract_json(raw)
-    parsed.setdefault("fold_id", fold_id)
-    parsed.setdefault("granularity", granularity)
-    (out_dir / "schema.json").write_text(json.dumps(parsed, ensure_ascii=False, indent=2))
     metadata = {
         "input_json": str(input_json),
         "output_dir": str(out_dir),
@@ -247,8 +250,17 @@ def induce_one(input_json: Path, output_dir: Path, granularity: str, client: Any
         "granularity": granularity,
         "fold_id": fold_id,
         "schema_design": "compact_roundtrip_ready_flat_dictionary_with_optional_controlled_modifiers",
+        "write_prompts_only": bool(write_prompts_only),
     }
-    (out_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2))
+    write_prompt_files(out_dir, messages, metadata)
+    if write_prompts_only:
+        return
+    raw = call_chat(client, cfg, messages)
+    (out_dir / "raw_response.txt").write_text(raw)
+    parsed = extract_json(raw)
+    parsed.setdefault("fold_id", fold_id)
+    parsed.setdefault("granularity", granularity)
+    (out_dir / "schema.json").write_text(json.dumps(parsed, ensure_ascii=False, indent=2))
     print(f"Wrote {out_dir / 'schema.json'}", flush=True)
 
 
@@ -271,6 +283,7 @@ def main() -> None:
     ap.add_argument("--model_key", required=True)
     ap.add_argument("--granularity", choices=["high", "low", "both"], default="both")
     ap.add_argument("--folds", default="all", help="all or comma-separated fold IDs like fold_00,fold_01")
+    ap.add_argument("--write_prompts_only", action="store_true", help="Write prompt files and exit without calling the LLM API.")
     args = ap.parse_args()
 
     cfg = load_model_config(Path(args.model_config_yaml), args.model_key)
@@ -279,7 +292,7 @@ def main() -> None:
     inputs = discover_inputs(Path(args.input_dir), args.folds)
     for inp in inputs:
         for granularity in granularities:
-            induce_one(inp, Path(args.output_dir), granularity, client, cfg)
+            induce_one(inp, Path(args.output_dir), granularity, client, cfg, args.write_prompts_only)
 
 
 if __name__ == "__main__":
