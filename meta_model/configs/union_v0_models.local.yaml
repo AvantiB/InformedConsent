@@ -1,7 +1,7 @@
 # Local Phase 1 model config.
 # Do not commit API keys, bearer tokens, private endpoints, local model paths, or cluster paths.
 
-# model_key is the script/output key, for example medgemma, qwen235b, llama4_scout, or mayo_gpt55.
+# model_key is the script/output key, for example medgemma, qwen235b, llama4_scout, mayo_gpt55, or mayo_gpt55_schema.
 # model is the exact model name sent to the API for OpenAI-compatible local servers.
 # For vLLM, model must exactly match --served-model-name.
 
@@ -49,5 +49,24 @@ models:
     top_p: 1
     max_tokens: 8192
     timeout_seconds: 120
+    max_retries: 6
+    retry_sleep_seconds: 10
+
+  mayo_gpt55_schema:
+    provider: mayo_apigee_azure_openai
+    model: gpt-5.5
+    deployment: gpt-5.5
+    api_version: "2024-10-21"
+    apigee_url: https://mcc.apix.mayo.edu
+    oauth_token_url: https://mcc.apix.mayo.edu/oauth/token
+    oauth_client_id_env: APIGEE_CLIENT_ID
+    oauth_client_secret_env: APIGEE_CLIENT_SECRET
+    api_key_file_env: APIGEE_TOKEN_FILE
+    api_key_env: APIGEE_TOKEN
+    omit_temperature: true
+    top_p: 1
+    reasoning_effort: low
+    max_tokens: 12000
+    timeout_seconds: 300
     max_retries: 6
     retry_sleep_seconds: 10
