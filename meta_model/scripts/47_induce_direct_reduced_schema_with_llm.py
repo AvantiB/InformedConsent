@@ -1,15 +1,10 @@
 #!/usr/bin/env python
 """Induce direct, source-model-grounded reduced consent schemas with one LLM.
 
-The Direct LLM arm is deliberately conservative: it starts from governed/expert
-source-model dictionaries plus optional requirements guidance and training-fold
-example sentences. It should stay close to DUO, ICO, ODRL, and FHIR Consent.
-The more exploratory arm is the later data-driven + LLM induction pipeline.
-
-The induced schema is required to be round-trip ready: its output includes a flat
-field dictionary, controlled modifiers, a forward annotation contract, and a
-source-model crosswalk so it can be converted directly into a forward-mapping
-schema for round-trip evaluation.
+This direct arm is conservative and round-trip oriented. The generated schema is a
+flat annotation dictionary plus optional controlled modifiers. It is intentionally
+compact so GPT-5.5 does not spend the full completion budget on hidden reasoning
+or verbose JSON.
 """
 from __future__ import annotations
 
@@ -32,9 +27,16 @@ try:
 except ImportError:
     OpenAI = None  # type: ignore
 
+MAX_GUIDANCE_CHARS = 5000
+MAX_SENTENCES = 25
+MAX_SENTENCE_CHARS = 260
+MAX_DICT_DEF_CHARS = 220
+MAX_DICT_ROWS_PER_MODEL = 120
 
-def norm(x: Any) -> str:
-    return "" if x is None else " ".join(str(x).split())
+
+def trunc(text: Any, n: int) -> str:
+    s = "" if text is None else " ".join(str(text).split())
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
 
 
 def load_model_config(path: Path, model_key: str) -> dict[str, Any]:
@@ -118,7 +120,7 @@ def extract_json(text: str) -> dict[str, Any]:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    obj = json.loads(t[start:i + 1])
+                    obj = json.loads(t[start : i + 1])
                     if not isinstance(obj, dict):
                         raise ValueError("Parsed JSON is not an object")
                     return obj
@@ -127,142 +129,98 @@ def extract_json(text: str) -> dict[str, Any]:
 
 def granularity_targets(granularity: str) -> tuple[int, int]:
     if granularity == "low":
-        return 12, 18
+        return 10, 15
     if granularity == "high":
-        return 24, 36
+        return 22, 30
     raise ValueError("granularity must be high or low")
+
+
+def compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    dictionaries = payload.get("source_model_dictionaries") or {}
+    compact_dicts: dict[str, list[dict[str, str]]] = {}
+    for model, rows in dictionaries.items():
+        compact_rows = []
+        for r in (rows or [])[:MAX_DICT_ROWS_PER_MODEL]:
+            compact_rows.append({
+                "source_model": trunc(r.get("source_model", model), 40),
+                "source_element_id": trunc(r.get("source_element_id", ""), 80),
+                "source_element_label": trunc(r.get("source_element_label", ""), 120),
+                "definition": trunc(r.get("definition", ""), MAX_DICT_DEF_CHARS),
+            })
+        compact_dicts[str(model)] = compact_rows
+
+    guidance_parts = []
+    for g in payload.get("requirements_guidance") or []:
+        if isinstance(g, dict):
+            guidance_parts.append(trunc(g.get("text", ""), MAX_GUIDANCE_CHARS))
+        else:
+            guidance_parts.append(trunc(g, MAX_GUIDANCE_CHARS))
+    guidance_text = trunc("\n\n".join([p for p in guidance_parts if p]), MAX_GUIDANCE_CHARS)
+
+    sentences = []
+    for s in (payload.get("representative_training_sentences") or [])[:MAX_SENTENCES]:
+        if isinstance(s, dict):
+            sentences.append(trunc(s.get("sentence_text", ""), MAX_SENTENCE_CHARS))
+        else:
+            sentences.append(trunc(s, MAX_SENTENCE_CHARS))
+
+    return {
+        "fold_id": payload.get("fold_id"),
+        "policy": "Conservative source-model-grounded flat dictionary; use NIH summary only as coverage pointers.",
+        "source_model_dictionaries": compact_dicts,
+        "requirements_guidance_summary": guidance_text,
+        "representative_training_sentences": sentences,
+    }
 
 
 def build_messages(payload: dict[str, Any], granularity: str) -> list[dict[str, str]]:
     target_min, target_max = granularity_targets(granularity)
-    payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
-    system = "You design conservative, machine-interpretable informed-consent schemas. Return valid JSON only."
+    payload_text = json.dumps(compact_payload(payload), ensure_ascii=False, separators=(",", ":"))
+    system = "Create compact JSON annotation schemas. Return JSON only. No prose."
     user = f"""
-Task: create a {granularity}-granularity reduced informed-consent meta-model that can be used directly for forward annotation and annotation-only backward reconstruction.
+Create a {granularity}-granularity reduced informed-consent annotation dictionary.
 
-Use these inputs:
-1. DUO, ICO, ODRL, and FHIR Consent dictionary rows.
-2. Requirements/guidance pointers, if present.
-3. Representative training-fold consent sentences.
+Goal: conservative merge of DUO/ICO/ODRL/FHIR span-level elements for round-trip annotation.
+Target {target_min}-{target_max} fields.
+Keep sentence_decision separate with values permit, deny, mixed, unclear.
+Flat dictionary only. Modifiers are optional controlled attributes attached to annotations, not labels.
+Use NIH guidance only as coverage checks, not field names.
 
-Design priorities:
-- Stay close to the source information models; they are governed/expert resources.
-- Consolidate near-equivalent source elements into reduced fields.
-- Keep distinct functional roles separate when merging would lose meaning.
-- Use requirements/guidance only to identify coverage needs and boundary cases.
-- Do not copy guideline headings as field names.
-- Keep sentence_decision separate from span-level fields.
-- Target {target_min}-{target_max} span-level fields.
-- Prefer a flat span-level dictionary.
-- Allow modifiers only when a controlled modifier is necessary for faithful representation and avoids unnecessary field proliferation.
-- Do not invent new fields unless no source-model-grounded field can represent a necessary requirement; mark any such field as requirement_driven_extension and justify it.
-
-Round-trip implementation constraints:
-- Every field must be usable as a dictionary row in a forward annotation prompt.
-- field_id must be stable, unique, short, and copied verbatim during annotation.
-- field_name must be snake_case and copied verbatim during annotation.
-- Field definitions must be specific enough for an annotator to choose spans without extra ontology context.
-- Modifiers must be controlled key-value attributes attached to annotations, not separate span labels.
-- Each modifier must list allowed_values and the fields it can attach to.
-- Do not require nested frames for this arm; this schema must remain usable as a flat dictionary plus optional modifiers.
-- The output must include dictionary_rows that can be converted directly to CSV for the forward round-trip runner.
-
-Return JSON exactly in this structure:
+Output compact JSON exactly with these keys:
 {{
-  "schema_id": "direct_llm_reduced_{granularity}_fold_specific",
-  "schema_status": "direct_llm_induced_source_model_grounded_training_fold",
-  "fold_id": "...",
-  "granularity": "{granularity}",
-  "sentence_decision": {{
-    "description": "Universal sentence/provision-level consent force, not an annotation label.",
-    "allowed_values": ["permit", "deny", "mixed", "unclear"]
-  }},
-  "forward_annotation_contract": {{
-    "prompt_dictionary_columns": ["field_id", "field_name", "definition", "include", "exclude", "allowed_modifiers"],
-    "required_forward_json_keys": ["sentence_decision", "annotations", "interpretation_units"],
-    "annotation_object": {{
-      "annotation_id": "a1",
-      "span_text": "exact text span",
-      "field_id": "exact schema field_id",
-      "field_name": "exact schema field_name",
-      "modifiers": [{{"modifier_name": "exact modifier_name", "value": "allowed value"}}],
-      "overlap_group_id": "g1 or null",
-      "span_relation": "single|same_span|broader_span|narrower_nested_span|partially_overlapping_span"
-    }},
-    "backward_packet_policy": "Use only valid annotation spans, static field definitions, controlled modifiers, sanitized relationship links, and sentence_decision."
-  }},
-  "fields": [
-    {{
-      "field_id": "DRS001",
-      "field_name": "snake_case_name",
-      "status": "core|extension",
-      "definition": "machine-interpretable definition for selecting spans",
-      "include": ["what belongs here"],
-      "exclude": ["boundary exclusions"],
-      "source_model_support": [
-        {{
-          "source_model": "DUO|ICO|ODRL|FHIR_Consent",
-          "source_element_id": "...",
-          "source_element_label": "...",
-          "mapping_type": "exact|near_equivalent|broader_than_target|narrower_than_target|context_dependent"
-        }}
-      ],
-      "requirement_basis": ["brief requirement/guidance basis if any"],
-      "requirement_driven_extension": false,
-      "allowed_modifiers": ["modifier_name if applicable"],
-      "annotation_guidance": "specific guidance for forward span annotation",
-      "machine_representation_notes": "how this field should appear in forward annotations"
-    }}
-  ],
-  "dictionary_rows": [
-    {{
-      "field_id": "DRS001",
-      "field_name": "snake_case_name",
-      "definition": "same final field definition",
-      "status": "core|extension",
-      "include": ["..."],
-      "exclude": ["..."],
-      "allowed_modifiers": ["modifier_name if applicable"],
-      "annotation_guidance": "specific guidance for forward annotation"
-    }}
-  ],
-  "modifiers": [
-    {{
-      "modifier_id": "MOD001",
-      "modifier_name": "snake_case_modifier",
-      "definition": "controlled annotation attribute, not a span label",
-      "allowed_values": ["..."],
-      "applies_to_fields": ["field_name or all"],
-      "source_or_requirement_basis": ["..."],
-      "required_for_faithful_reconstruction": true
-    }}
-  ],
-  "crosswalk": [
-    {{
-      "source_model": "DUO|ICO|ODRL|FHIR_Consent",
-      "source_element_id": "...",
-      "source_element_label": "...",
-      "target_field_id": "DRS001 or null",
-      "target_field_name": "... or null",
-      "mapping_type": "exact|near_equivalent|broader_than_target|narrower_than_target|context_dependent|modifier_attribute|no_direct_mapping",
-      "needs_expert_review": true,
-      "mapping_rationale": "..."
-    }}
-  ],
-  "requirements_coverage": [
-    {{
-      "requirement": "permission/prohibition/restriction/obligation/temporal/condition/identifiability/sharing/withdrawal/consequence/etc.",
-      "covered_by": ["field_or_modifier_name"],
-      "coverage_note": "..."
-    }}
-  ],
-  "unsafe_merge_notes": ["..."],
-  "missing_or_uncertain_functions": ["..."],
-  "expert_review_flags": ["..."]
+ "schema_id":"direct_llm_reduced_{granularity}_fold_specific",
+ "fold_id":"...",
+ "granularity":"{granularity}",
+ "sentence_decision":{{"allowed_values":["permit","deny","mixed","unclear"]}},
+ "dictionary_rows":[{{
+   "field_id":"DRS001",
+   "field_name":"snake_case",
+   "definition":"<=25 words; span-selection definition",
+   "include":["<=3 short examples"],
+   "exclude":["<=3 short boundaries"],
+   "allowed_modifiers":["modifier_name"],
+   "source_support":["MODEL:id label"]
+ }}],
+ "modifiers":[{{
+   "modifier_name":"snake_case",
+   "definition":"<=20 words",
+   "allowed_values":["value1","value2"],
+   "applies_to_fields":["field_name or all"]
+ }}],
+ "requirements_coverage":[{{"requirement":"short name","covered_by":["field_or_modifier"]}}],
+ "expert_review_flags":["brief flags"]
 }}
 
-Input packet:
-{payload_text}
+Constraints:
+- No duplicate fields array; dictionary_rows is the field dictionary.
+- No full source crosswalk.
+- Max 8 source_support strings per field.
+- Max 8 modifiers total.
+- Definitions must be annotation-ready, not conceptual essays.
+- Field IDs must be unique and stable.
+- Do not include rationale paragraphs.
+
+Input:{payload_text}
 """.strip()
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -272,7 +230,9 @@ def induce_one(input_json: Path, output_dir: Path, granularity: str, client: Any
     fold_id = payload.get("fold_id", input_json.parent.name)
     out_dir = output_dir / str(fold_id) / granularity
     out_dir.mkdir(parents=True, exist_ok=True)
-    raw = call_chat(client, cfg, build_messages(payload, granularity))
+    messages = build_messages(payload, granularity)
+    (out_dir / "prompt_messages.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2))
+    raw = call_chat(client, cfg, messages)
     (out_dir / "raw_response.txt").write_text(raw)
     parsed = extract_json(raw)
     parsed.setdefault("fold_id", fold_id)
@@ -286,7 +246,7 @@ def induce_one(input_json: Path, output_dir: Path, granularity: str, client: Any
         "provider": cfg.get("provider"),
         "granularity": granularity,
         "fold_id": fold_id,
-        "schema_design": "roundtrip_ready_flat_dictionary_with_optional_controlled_modifiers",
+        "schema_design": "compact_roundtrip_ready_flat_dictionary_with_optional_controlled_modifiers",
     }
     (out_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2))
     print(f"Wrote {out_dir / 'schema.json'}", flush=True)
