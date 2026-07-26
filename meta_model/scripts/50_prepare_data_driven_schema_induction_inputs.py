@@ -1,18 +1,23 @@
 #!/usr/bin/env python
-"""Prepare fold-specific data-driven schema induction inputs.
+"""Prepare fold-specific inputs for data-driven schema induction.
 
-This script builds the data-driven LLM schema-induction packets from corrected
-round-trip outputs. For each held-out fold, it uses only training-fold evidence
-from baseline source-model/Union runs.
+This data-driven arm uses the original annotation dataset only, excluding NA-only
+annotation rows. It does not use baseline round-trip outputs, classifier scores,
+or reconstructed sentences.
 
-Expected input is the scored CSV produced by:
-  49_compile_schema_strategy_roundtrips.py -> standardized_roundtrips.csv
-  09_score_roundtrip_outputs.py -> scored_roundtrips.csv
+For each held-out fold, the script builds an induction packet from training-fold
+annotation evidence:
 
-The script joins rows back to the original roundtrips CSV by sentence text to
-recover form_key/fold membership, then excludes any evidence from held-out forms.
-If a sentence appears in both training and held-out forms, it is excluded for
-that held-out fold to avoid text-level leakage.
+- source element profiles from original annotations;
+- span examples and sentence examples;
+- within-sentence co-occurrence edges;
+- representative training sentences.
+
+The source dictionaries may be used only to attach static metadata/definitions to
+labels that already occur in the original annotation dataset. Held-out forms are
+excluded from the packet for their fold. When the same sentence text appears in a
+held-out form, matching training rows are excluded for that fold as a conservative
+anti-leakage rule.
 """
 from __future__ import annotations
 
@@ -29,8 +34,23 @@ import pandas as pd
 
 TEXT_COL_CANDIDATES = ["canonical_full_text", "full_text_original", "original_sentence", "full_text", "sentence", "text"]
 FORM_KEY_CANDIDATES = ["form_key", "form_id", "document_id", "source_form", "file_name"]
-DEFAULT_CONDITIONS = ["individual_source_model_json", "union_v0_full_dictionary"]
+ANNOTATION_COL_CANDIDATES = ["annotations_serialized", "annotations_json", "annotations", "forward_mapping"]
+INFO_MODEL_CANDIDATES = ["information_model", "info_model", "source_model"]
+LLM_CANDIDATES = ["llm", "model"]
 SENTENCE_DECISIONS = ["permit", "deny", "mixed", "unclear"]
+NA_VALUES = {"", "na", "n/a", "none", "null", "unknown", "not applicable", "no annotation"}
+SENTENCE_LEVEL_LABELS = {
+    "odrl::rule_testsentence",
+    "rule_testsentence",
+    "fhir_consent::consent.provision.type",
+    "fhir::consent.provision.type",
+    "consent.provision.type",
+    "fhir_consent::consent.decision",
+    "fhir::consent.decision",
+    "consent.decision",
+    "duo::duo.decision",
+    "ico::ico.decision",
+}
 
 
 def norm(x: Any) -> str:
@@ -63,6 +83,61 @@ def stable_fold(key: str, n_folds: int) -> int:
     return int(digest[:8], 16) % n_folds
 
 
+def source_model_aliases(model: str) -> set[str]:
+    m = norm(model)
+    return {m, m.replace("_Consent", ""), m.replace("_", "")}
+
+
+def load_folds(roundtrips: pd.DataFrame, form_col: str, n_folds: int, fold_assignments_csv: str | None) -> pd.DataFrame:
+    if fold_assignments_csv:
+        folds = pd.read_csv(fold_assignments_csv).fillna("")
+        if "form_key" not in folds.columns or "fold_id" not in folds.columns:
+            raise ValueError("fold_assignments_csv must contain form_key and fold_id columns")
+        folds = folds[["form_key", "fold_id"]].copy()
+        folds["form_key"] = folds["form_key"].map(norm)
+        folds["fold_id"] = folds["fold_id"].map(norm)
+        return folds.drop_duplicates(subset=["form_key"])
+    forms = sorted(roundtrips[form_col].map(norm).dropna().unique())
+    return pd.DataFrame([{"form_key": f, "fold_id": f"fold_{stable_fold(f, n_folds):02d}"} for f in forms if f])
+
+
+def load_inventory(path: str | None) -> pd.DataFrame:
+    if not path:
+        return pd.DataFrame()
+    p = Path(path)
+    if not p.exists():
+        return pd.DataFrame()
+    inv = pd.read_csv(p).fillna("")
+    required = {"source_model", "source_element_id", "source_element_label"}
+    if not required.issubset(set(inv.columns)):
+        return pd.DataFrame()
+    if "source_element_definition" not in inv.columns:
+        inv["source_element_definition"] = ""
+    if "element_scope" not in inv.columns:
+        inv["element_scope"] = "span"
+    inv = inv[~inv["element_scope"].astype(str).str.casefold().str.contains("sentence", na=False)].copy()
+    return inv
+
+
+def build_inventory_lookup(inv: pd.DataFrame) -> dict[tuple[str, str], dict[str, str]]:
+    lookup: dict[tuple[str, str], dict[str, str]] = {}
+    if inv.empty:
+        return lookup
+    for _, r in inv.iterrows():
+        model = norm(r.get("source_model"))
+        meta = {
+            "source_model": model,
+            "source_element_id": norm(r.get("source_element_id")),
+            "source_element_label": norm(r.get("source_element_label")),
+            "source_element_definition": norm(r.get("source_element_definition")),
+        }
+        for alias in source_model_aliases(model):
+            for key in [meta["source_element_id"], meta["source_element_label"]]:
+                if key:
+                    lookup[(alias.casefold(), key.casefold())] = meta
+    return lookup
+
+
 def parse_jsonish(text: Any) -> Any:
     t = norm(text)
     if not t:
@@ -84,87 +159,91 @@ def parse_jsonish(text: Any) -> Any:
     return None
 
 
-def source_text_col(df: pd.DataFrame) -> str:
-    for c in ["original_text", "source_text", "original_sentence", "sentence_text"]:
-        if c in df.columns:
-            return c
-    return pick_col(df, TEXT_COL_CANDIDATES) or ""
+def is_na_value(x: Any) -> bool:
+    s = norm(x).casefold().strip("[](){} .;:,\t\n")
+    return s in NA_VALUES
 
 
-def load_form_sentence_map(roundtrips_csv: Path, n_folds: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    df = pd.read_csv(roundtrips_csv).fillna("")
-    form_col = pick_col(df, FORM_KEY_CANDIDATES)
-    text_col = pick_col(df, TEXT_COL_CANDIDATES)
-    m = df[[form_col, text_col]].copy()
-    m.columns = ["form_key", "sentence_text"]
-    m["form_key"] = m["form_key"].map(norm)
-    m["sentence_text"] = m["sentence_text"].map(norm)
-    m["text_key"] = m["sentence_text"].map(text_key)
-    m = m[(m["form_key"] != "") & (m["text_key"] != "")].drop_duplicates(subset=["form_key", "text_key"])
-    forms = sorted(m["form_key"].unique())
-    folds = pd.DataFrame([{"form_key": f, "fold_id": f"fold_{stable_fold(f, n_folds):02d}"} for f in forms])
-    return m.merge(folds, on="form_key", how="left"), folds
+def is_sentence_level_label(source_model: str, label: str) -> bool:
+    raw = norm(label).casefold()
+    model = norm(source_model).casefold()
+    candidates = {raw, f"{model}::{raw}"}
+    return bool(candidates & SENTENCE_LEVEL_LABELS)
 
 
-def attach_form_keys(scored: pd.DataFrame, form_sentence_map: pd.DataFrame) -> pd.DataFrame:
-    text_col = source_text_col(scored)
-    out = scored.copy()
-    out["_source_text"] = out[text_col].map(norm)
-    out["text_key"] = out["_source_text"].map(text_key)
-    # Aggregate possible form keys by exact text. If any heldout form has the same text,
-    # that row is excluded for that fold to avoid sentence-text leakage.
-    grouped = form_sentence_map.groupby("text_key").agg(
-        form_keys=("form_key", lambda x: sorted(set(map(str, x)))),
-        fold_ids=("fold_id", lambda x: sorted(set(map(str, x)))),
-    ).reset_index()
-    out = out.merge(grouped, on="text_key", how="left")
-    out["form_keys"] = out["form_keys"].apply(lambda x: x if isinstance(x, list) else [])
-    out["fold_ids"] = out["fold_ids"].apply(lambda x: x if isinstance(x, list) else [])
+def parse_annotations(value: Any, source_model: str, inventory_lookup: dict[tuple[str, str], dict[str, str]]) -> list[dict[str, str]]:
+    obj = parse_jsonish(value)
+    raw_annotations: list[Any]
+    if isinstance(obj, dict):
+        raw_annotations = obj.get("annotations") or obj.get("valid_annotations") or []
+    elif isinstance(obj, list):
+        raw_annotations = obj
+    else:
+        raw_annotations = []
+
+    parsed: list[dict[str, str]] = []
+    if raw_annotations:
+        for a in raw_annotations:
+            if not isinstance(a, dict):
+                continue
+            span = norm(a.get("span_text") or a.get("evidence_span_text") or a.get("span") or a.get("text") or a.get("value"))
+            label = norm(a.get("source_element_label") or a.get("label_name") or a.get("field_name") or a.get("label") or a.get("element_label") or a.get("name"))
+            element_id = norm(a.get("source_element_id") or a.get("label_id") or a.get("element_id") or a.get("field_id") or a.get("id"))
+            decision = norm(a.get("decision") or a.get("sentence_decision") or a.get("polarity"))
+            parsed.append(make_annotation(span, label or element_id, decision, source_model, inventory_lookup))
+    else:
+        text = norm(value)
+        # Compact format examples: span [label] (decision); span [label] (decision)
+        pattern = re.compile(r"([^\[\]\n;]+?)\s*\[([^\[\]]+)\]\s*(?:\(([^)]*)\))?")
+        for m in pattern.finditer(text):
+            span, label, decision = m.group(1), m.group(2), m.group(3) or ""
+            parsed.append(make_annotation(span, label, decision, source_model, inventory_lookup))
+
+    out = []
+    for a in parsed:
+        if not a:
+            continue
+        if is_na_value(a.get("span_text")) and is_na_value(a.get("source_element_label") or a.get("source_element_id")):
+            continue
+        if is_na_value(a.get("source_element_label")) or is_sentence_level_label(source_model, a.get("source_element_label", "")):
+            continue
+        if not norm(a.get("span_text")) or not (norm(a.get("source_element_label")) or norm(a.get("source_element_id"))):
+            continue
+        out.append(a)
     return out
 
 
-def annotation_list(obj: Any) -> list[dict[str, Any]]:
-    if isinstance(obj, dict):
-        anns = obj.get("annotations") or obj.get("valid_annotations") or []
-    elif isinstance(obj, list):
-        anns = obj
+def make_annotation(span: Any, label: Any, decision: Any, source_model: str, inventory_lookup: dict[tuple[str, str], dict[str, str]]) -> dict[str, str]:
+    span_s = norm(span)
+    label_s = norm(label)
+    source_model_s = norm(source_model)
+    meta = None
+    for alias in source_model_aliases(source_model_s):
+        meta = inventory_lookup.get((alias.casefold(), label_s.casefold()))
+        if meta:
+            break
+    if meta:
+        source_model_s = meta["source_model"] or source_model_s
+        element_id = meta["source_element_id"]
+        element_label = meta["source_element_label"] or label_s
+        definition = meta["source_element_definition"]
     else:
-        anns = []
-    return [a for a in anns if isinstance(a, dict)]
-
-
-def extract_ann_fields(a: dict[str, Any], default_info_model: str) -> dict[str, str]:
-    label_id = norm(
-        a.get("union_element_id")
-        or a.get("label_id")
-        or a.get("source_element_id")
-        or a.get("field_id")
-        or a.get("element_id")
-        or a.get("id")
-    )
-    label_name = norm(
-        a.get("source_element_label")
-        or a.get("label_name")
-        or a.get("field_name")
-        or a.get("label")
-        or a.get("element_label")
-        or a.get("name")
-    )
-    label_definition = norm(a.get("label_definition") or a.get("source_element_definition") or a.get("field_definition") or a.get("definition"))
-    span = norm(a.get("span_text") or a.get("evidence_span_text") or a.get("span") or a.get("text") or a.get("value"))
-    source_model = norm(a.get("source_model") or default_info_model)
+        element_id = ""
+        element_label = label_s
+        definition = ""
     return {
-        "label_id": label_id,
-        "label_name": label_name,
-        "label_definition": label_definition,
-        "span_text": span,
-        "source_model": source_model,
+        "span_text": span_s,
+        "source_model": source_model_s,
+        "source_element_id": element_id,
+        "source_element_label": element_label,
+        "source_element_definition": definition,
+        "decision_or_tag": norm(decision),
     }
 
 
-def label_key(x: dict[str, str]) -> str:
-    sid = x["label_id"] or x["label_name"]
-    return f"{x['source_model']}::{sid}"
+def element_key(a: dict[str, str]) -> str:
+    ident = a.get("source_element_id") or a.get("source_element_label")
+    return f"{a.get('source_model')}::{ident}"
 
 
 def compact_examples(values: list[str], max_n: int, max_chars: int) -> list[str]:
@@ -183,202 +262,197 @@ def compact_examples(values: list[str], max_n: int, max_chars: int) -> list[str]
     return out
 
 
-def build_fold_input(
-    scored: pd.DataFrame,
-    folds: pd.DataFrame,
-    fold_id: str,
-    include_conditions: set[str],
-    min_score_for_supported: float,
-    max_profiles: int,
-    max_edges: int,
-    max_examples: int,
-) -> dict[str, Any]:
+def build_fold_payload(df: pd.DataFrame, folds: pd.DataFrame, fold_id: str, max_profiles: int, max_edges: int, max_sentences: int, exclude_heldout_text_overlap: bool) -> dict[str, Any]:
     heldout_forms = set(folds.loc[folds["fold_id"] == fold_id, "form_key"].map(norm))
-    train = scored[scored["condition"].isin(include_conditions)].copy()
-    # Training-fold only. Exclude rows with the heldout fold among possible text matches.
-    train = train[~train["fold_ids"].apply(lambda xs: fold_id in set(xs or []))].copy()
+    heldout_text_keys = set(df.loc[df["form_key"].isin(heldout_forms), "text_key"])
+    train = df[~df["form_key"].isin(heldout_forms)].copy()
+    if exclude_heldout_text_overlap:
+        train = train[~train["text_key"].isin(heldout_text_keys)].copy()
 
-    profile = {}
+    raw_counts: Counter[str] = Counter()
+    sentence_counts: Counter[str] = Counter()
+    form_sets: dict[str, set[str]] = defaultdict(set)
+    llm_support: dict[str, set[str]] = defaultdict(set)
+    source_model_support: dict[str, set[str]] = defaultdict(set)
     span_examples: dict[str, list[str]] = defaultdict(list)
     sentence_examples: dict[str, list[str]] = defaultdict(list)
-    model_support: dict[str, set[str]] = defaultdict(set)
-    llm_support: dict[str, set[str]] = defaultdict(set)
-    score_values: dict[str, list[float]] = defaultdict(list)
-    supported_counts: Counter[str] = Counter()
-    raw_counts: Counter[str] = Counter()
+    decision_examples: dict[str, list[str]] = defaultdict(list)
+    profile_base: dict[str, dict[str, Any]] = {}
     edge_counts: Counter[tuple[str, str]] = Counter()
-    edge_support_sentences: dict[tuple[str, str], set[str]] = defaultdict(set)
-
-    row_examples_high = []
-    row_examples_low = []
+    edge_form_sets: dict[tuple[str, str], set[str]] = defaultdict(set)
 
     for _, row in train.iterrows():
-        obj = parse_jsonish(row.get("forward_mapping"))
-        anns_raw = annotation_list(obj)
-        keys_for_row = []
-        score = row.get("classifier_preservation_score", None)
-        try:
-            score_f = float(score)
-        except Exception:
-            score_f = None
-        info_model = norm(row.get("information_model"))
-        llm = norm(row.get("llm"))
-        source_text = norm(row.get("original_text") or row.get("source_text") or row.get("_source_text"))
-        reconstructed = norm(row.get("reconstructed_text") or row.get("reconstructed_sentence"))
-        source_id = norm(row.get("source_id") or row.get("roundtrip_id"))
-
-        for ann in anns_raw:
-            x = extract_ann_fields(ann, info_model)
-            if not (x["label_id"] or x["label_name"]) or not x["span_text"]:
-                continue
-            k = label_key(x)
-            keys_for_row.append(k)
+        anns = row["valid_annotations"]
+        keys_this_row = []
+        for a in anns:
+            k = element_key(a)
+            keys_this_row.append(k)
             raw_counts[k] += 1
-            model_support[k].add(x["source_model"] or info_model)
-            llm_support[k].add(llm)
-            if score_f is not None:
-                score_values[k].append(score_f)
-                if score_f >= min_score_for_supported:
-                    supported_counts[k] += 1
-            span_examples[k].append(x["span_text"])
-            sentence_examples[k].append(source_text)
-            if k not in profile:
-                profile[k] = {
+            form_sets[k].add(row["form_key"])
+            llm_support[k].add(row["llm"])
+            source_model_support[k].add(a["source_model"])
+            span_examples[k].append(a["span_text"])
+            sentence_examples[k].append(row["sentence_text"])
+            if a.get("decision_or_tag"):
+                decision_examples[k].append(a["decision_or_tag"])
+            if k not in profile_base:
+                profile_base[k] = {
                     "source_element_key": k,
-                    "source_model": x["source_model"] or info_model,
-                    "source_element_id": x["label_id"],
-                    "source_element_label": x["label_name"],
-                    "source_element_definition": x["label_definition"],
+                    "source_model": a["source_model"],
+                    "source_element_id": a["source_element_id"],
+                    "source_element_label": a["source_element_label"],
+                    "source_element_definition": a["source_element_definition"],
                 }
-
-        uniq = sorted(set(keys_for_row))
-        for a, b in itertools.combinations(uniq, 2):
+        for k in set(keys_this_row):
+            sentence_counts[k] += 1
+        for a, b in itertools.combinations(sorted(set(keys_this_row)), 2):
             edge = tuple(sorted((a, b)))
             edge_counts[edge] += 1
-            if source_id:
-                edge_support_sentences[edge].add(source_id)
+            edge_form_sets[edge].add(row["form_key"])
 
-        if score_f is not None and source_text:
-            rec = {"source_text": source_text[:350], "reconstructed_text": reconstructed[:350], "score": score_f, "condition": norm(row.get("condition")), "llm": llm}
-            if score_f >= min_score_for_supported and len(row_examples_high) < max_examples:
-                row_examples_high.append(rec)
-            elif score_f < 0.5 and len(row_examples_low) < max_examples:
-                row_examples_low.append(rec)
-
-    profile_rows = []
-    for k, base in profile.items():
-        scores = score_values.get(k, [])
-        profile_rows.append({
+    profiles = []
+    for k, base in profile_base.items():
+        profiles.append({
             **base,
             "raw_mention_count": int(raw_counts[k]),
-            "supported_mention_count": int(supported_counts[k]),
-            "mean_preservation_score": sum(scores) / len(scores) if scores else None,
-            "source_model_support": sorted(model_support[k]),
+            "sentence_count": int(sentence_counts[k]),
+            "form_count": len(form_sets[k]),
+            "source_model_support": sorted(source_model_support[k]),
             "llm_support": sorted(llm_support[k]),
-            "example_spans": compact_examples(span_examples[k], 6, 80),
-            "example_sentences": compact_examples(sentence_examples[k], 3, 220),
+            "example_spans": compact_examples(span_examples[k], 8, 90),
+            "example_sentences": compact_examples(sentence_examples[k], 4, 240),
+            "decision_or_tag_examples": compact_examples(decision_examples[k], 6, 60),
         })
-    profile_rows.sort(key=lambda r: (r["supported_mention_count"], r["raw_mention_count"]), reverse=True)
-    profile_rows = profile_rows[:max_profiles]
-    kept = {r["source_element_key"] for r in profile_rows}
+    profiles.sort(key=lambda r: (r["form_count"], r["sentence_count"], r["raw_mention_count"]), reverse=True)
+    profiles = profiles[:max_profiles]
+    kept = {p["source_element_key"] for p in profiles}
 
-    edge_rows = []
+    edges = []
     for (a, b), c in edge_counts.most_common():
         if a not in kept or b not in kept:
             continue
-        edge_rows.append({
+        edges.append({
             "source_element_key_a": a,
             "source_element_key_b": b,
             "cooccurrence_count": int(c),
-            "support_sentence_count": len(edge_support_sentences.get((a, b), set())),
+            "form_count": len(edge_form_sets[(a, b)]),
         })
-        if len(edge_rows) >= max_edges:
+        if len(edges) >= max_edges:
             break
 
+    representative_sentences = []
+    sent_df = train.drop_duplicates(subset=["form_key", "sentence_text"]).head(max_sentences)
+    for _, r in sent_df.iterrows():
+        representative_sentences.append({"form_key": r["form_key"], "sentence_text": r["sentence_text"]})
+
     return {
-        "schema_induction_arm": "data_driven_llm_training_fold_evidence",
+        "schema_induction_arm": "data_driven_original_annotation_dataset",
         "fold_id": fold_id,
         "heldout_form_keys": sorted(heldout_forms),
         "evidence_policy": {
+            "source": "original annotation dataset only",
+            "na_only_annotation_rows_excluded": True,
+            "baseline_roundtrip_outputs_used": False,
+            "classifier_scores_used": False,
+            "reconstructions_used": False,
             "training_only": True,
             "heldout_fold_excluded": fold_id,
-            "included_conditions": sorted(include_conditions),
-            "min_score_for_supported": min_score_for_supported,
+            "heldout_text_overlap_excluded": bool(exclude_heldout_text_overlap),
             "sentence_decision": {"field": "sentence_decision", "allowed_values": SENTENCE_DECISIONS, "not_a_dictionary_label": True},
             "schema_shape": "flat span-level dictionary with optional model-chosen modifiers",
         },
         "training_evidence_counts": {
-            "n_training_roundtrip_rows": int(len(train)),
-            "n_source_element_profiles": len(profile_rows),
-            "n_cooccurrence_edges": len(edge_rows),
+            "n_training_rows_after_na_filter": int(len(train)),
+            "n_source_element_profiles": len(profiles),
+            "n_cooccurrence_edges": len(edges),
         },
-        "source_element_profiles": profile_rows,
-        "cooccurrence_edges": edge_rows,
-        "high_preservation_examples": row_examples_high,
-        "low_preservation_examples": row_examples_low,
+        "source_element_profiles": profiles,
+        "cooccurrence_edges": edges,
+        "representative_training_sentences": representative_sentences,
     }
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--scored_roundtrips_csv", required=True)
-    ap.add_argument("--roundtrips_csv", required=True)
-    ap.add_argument("--fold_assignments_csv", default=None, help="Optional existing form_key/fold_id CSV. If omitted, folds are reconstructed by hash.")
+    ap.add_argument("--roundtrips_csv", required=True, help="Original annotation dataset / roundtrips CSV.")
+    ap.add_argument("--inventory_csv", default="meta_model/v0_union/source_element_inventory.csv", help="Optional source dictionary metadata; only labels present in original annotations are used.")
+    ap.add_argument("--fold_assignments_csv", default=None)
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--n_folds", type=int, default=4)
-    ap.add_argument("--include_conditions", default=",".join(DEFAULT_CONDITIONS))
-    ap.add_argument("--min_score_for_supported", type=float, default=0.7)
-    ap.add_argument("--max_profiles", type=int, default=120)
-    ap.add_argument("--max_edges", type=int, default=160)
-    ap.add_argument("--max_examples", type=int, default=24)
+    ap.add_argument("--max_profiles", type=int, default=140)
+    ap.add_argument("--max_edges", type=int, default=180)
+    ap.add_argument("--max_sentences", type=int, default=50)
+    ap.add_argument("--keep_heldout_text_overlap", action="store_true")
     args = ap.parse_args()
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    form_map, folds_hash = load_form_sentence_map(Path(args.roundtrips_csv), args.n_folds)
-    if args.fold_assignments_csv:
-        folds = pd.read_csv(args.fold_assignments_csv).fillna("")
-        if "form_key" not in folds.columns or "fold_id" not in folds.columns:
-            raise ValueError("fold_assignments_csv must contain form_key and fold_id")
-        folds = folds[["form_key", "fold_id"]].copy()
-        folds["form_key"] = folds["form_key"].map(norm)
-        folds["fold_id"] = folds["fold_id"].map(norm)
-        form_map = form_map.drop(columns=["fold_id"], errors="ignore").merge(folds, on="form_key", how="left")
-    else:
-        folds = folds_hash
+    df0 = pd.read_csv(args.roundtrips_csv).fillna("")
+    form_col = pick_col(df0, FORM_KEY_CANDIDATES)
+    text_col = pick_col(df0, TEXT_COL_CANDIDATES)
+    ann_col = pick_col(df0, ANNOTATION_COL_CANDIDATES)
+    info_col = pick_col(df0, INFO_MODEL_CANDIDATES, required=False)
+    llm_col = pick_col(df0, LLM_CANDIDATES, required=False)
 
-    scored = pd.read_csv(args.scored_roundtrips_csv).fillna("")
-    scored = attach_form_keys(scored, form_map)
-    include_conditions = {x.strip() for x in args.include_conditions.split(",") if x.strip()}
+    folds = load_folds(df0, form_col, args.n_folds, args.fold_assignments_csv)
+    inv = load_inventory(args.inventory_csv)
+    lookup = build_inventory_lookup(inv)
+
+    rows = []
+    excluded_na = 0
+    for _, r in df0.iterrows():
+        form_key = norm(r.get(form_col))
+        sentence = norm(r.get(text_col))
+        source_model = norm(r.get(info_col)) if info_col else ""
+        llm = norm(r.get(llm_col)) if llm_col else ""
+        anns = parse_annotations(r.get(ann_col), source_model, lookup)
+        if not anns:
+            excluded_na += 1
+            continue
+        rows.append({
+            "form_key": form_key,
+            "sentence_text": sentence,
+            "text_key": text_key(sentence),
+            "source_model": source_model,
+            "llm": llm,
+            "valid_annotations": anns,
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError("No valid non-NA annotations were parsed from the original dataset.")
+    df = df.merge(folds, on="form_key", how="left")
 
     folds.to_csv(out / "data_driven_fold_assignments.csv", index=False)
     for fold_id in sorted(folds["fold_id"].unique()):
-        payload = build_fold_input(
-            scored,
+        payload = build_fold_payload(
+            df,
             folds,
             fold_id,
-            include_conditions,
-            args.min_score_for_supported,
             args.max_profiles,
             args.max_edges,
-            args.max_examples,
+            args.max_sentences,
+            exclude_heldout_text_overlap=not args.keep_heldout_text_overlap,
         )
         fold_dir = out / fold_id
         fold_dir.mkdir(parents=True, exist_ok=True)
         (fold_dir / "data_driven_induction_input.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
     manifest = {
-        "scored_roundtrips_csv": args.scored_roundtrips_csv,
         "roundtrips_csv": args.roundtrips_csv,
+        "inventory_csv": args.inventory_csv,
         "fold_assignments_csv": args.fold_assignments_csv,
-        "include_conditions": sorted(include_conditions),
-        "min_score_for_supported": args.min_score_for_supported,
+        "n_original_rows": int(len(df0)),
+        "n_valid_annotation_rows": int(len(df)),
+        "n_excluded_na_or_empty_annotation_rows": int(excluded_na),
         "max_profiles": args.max_profiles,
         "max_edges": args.max_edges,
-        "max_examples": args.max_examples,
+        "max_sentences": args.max_sentences,
+        "baseline_roundtrip_outputs_used": False,
+        "classifier_scores_used": False,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    print(f"Wrote data-driven induction inputs under {out}")
+    print(f"Wrote data-driven original-annotation induction inputs under {out}")
+    print(json.dumps(manifest, indent=2))
 
 
 if __name__ == "__main__":
