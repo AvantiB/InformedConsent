@@ -1,19 +1,24 @@
 #!/usr/bin/env python
-"""Data-driven informed-consent meta-model induction with form-level CV.
+"""Data-driven informed-consent meta-model signal extraction with form-level CV.
 
 Paper-facing workflow implemented here:
 
 A. Build one provenance-preserving row per original annotation mention.
-B. Retain only span-level annotations whose human round-trip meaning-preservation
-   label is 1 as valid induction evidence.
-C. Split broad source elements into context-specific source-element-sense nodes.
-D. Compute recurrence, span overlap, nesting, co-occurrence, proximity,
-   cross-model/cross-LLM support, lexical/embedding similarity, PMI/lift, and
-   positive/negative preservation support for sense-node pairs.
-E. Type pairwise relations as near_equivalent, broader_narrower,
-   complementary, related_context_only, or unsafe_to_merge.
-F. Cluster only near_equivalent edges. Preserve complementary/proximity edges as
-   a separate functional/provision-bundle graph.
+B. Treat a mention as valid induction evidence only when:
+   - the human round-trip meaning-preservation label is 1;
+   - the LLM produced at least one valid span-level non-NA tag;
+   - the mention has a non-NA span and non-NA source element;
+   - the mention is not sentence-level metadata or reserved/non-annotation text.
+C. Retain negative/failure rows separately for audit/failure support, but never use
+   them to seed source-element-sense nodes or schema fields.
+D. Split broad source elements into context-specific source-element-sense nodes.
+E. Compute recurrence, span overlap, nesting, within/cross information-model
+   co-occurrence, within/cross LLM co-occurrence, proximity, cross-model/cross-LLM
+   support, lexical/embedding similarity, PMI/lift, and positive/negative support.
+F. Type pairwise relations as near_equivalent, broader_narrower, complementary,
+   related_context_only, or unsafe_to_merge.
+G. Cluster only near_equivalent edges. Keep complementary/proximity edges as a
+   separate functional/provision-bundle graph for evidence-card generation.
 
 The evidence-card and LLM induction stages are handled by scripts 28 and 29.
 """
@@ -264,6 +269,8 @@ def parse_annotations(row: pd.Series, ann_col: str, info_model: str, lookup: dic
         raw_anns = obj.get("annotations") or obj.get("valid_annotations") or []
     if not raw_anns:
         raw_anns = compact_annotation_parser(raw)
+    if not raw_anns and is_na(raw):
+        return [], [{"annotation_index": "", "span_text": raw, "label": raw, "reason": "na_only"}]
 
     valid, audit = [], []
     for i, ann in enumerate(raw_anns, start=1):
@@ -351,18 +358,45 @@ def build_mentions(df: pd.DataFrame, folds: pd.DataFrame, test_fold: str, inv: p
         preserved = positive_label(r.get(preserved_col))
         anns, audit = parse_annotations(r, ann_col, info, lookup)
         for a in audit:
-            audit_rows.append({"source_row": row_idx + 2, "roundtrip_id": roundtrip_id(r, row_idx), "form_id": form, "sentence_id": sent_id, "information_model": info, "llm": llm, **a})
+            audit_rows.append({"source_row": row_idx + 2, "roundtrip_id": roundtrip_id(r, row_idx), "form_id": form, "sentence_id": sent_id, "information_model": info, "llm": llm, "row_level_exclusion": False, "roundtrip_meaning_preserved": preserved, **a})
+
+        audit_reasons = [a.get("reason", "") for a in audit]
+        if preserved == 1 and not anns:
+            if audit_reasons and all(x == "na_only" for x in audit_reasons):
+                row_reason = "positive_preserved_but_solely_na_llm_tags"
+            else:
+                row_reason = "positive_preserved_but_no_valid_span_annotations"
+            audit_rows.append({
+                "source_row": row_idx + 2,
+                "roundtrip_id": roundtrip_id(r, row_idx),
+                "form_id": form,
+                "sentence_id": sent_id,
+                "information_model": info,
+                "llm": llm,
+                "annotation_index": "",
+                "span_text": "",
+                "label": "",
+                "reason": row_reason,
+                "row_level_exclusion": True,
+                "roundtrip_meaning_preserved": preserved,
+            })
+            continue
+        if not anns:
+            continue
+
         occurrence_counter: Counter[str] = Counter()
         toks = token_offsets(text)
         for ann in anns:
             span = ann["span_text"]
+            source_id = ann["source_element_id"] or ann["source_element_label"]
+            if is_na(span) or is_na(source_id):
+                continue
             occ = occurrence_counter[span.casefold()]
             occurrence_counter[span.casefold()] += 1
             start, end = find_span_offsets(text, span, occ)
             tok_start, tok_end = char_to_token_span(toks, start, end)
             left = text[max(0, start - 100):start] if start >= 0 else ""
             right = text[end:min(len(text), end + 100)] if end >= 0 else ""
-            source_id = ann["source_element_id"] or ann["source_element_label"]
             source_key = f"{ann['source_model']}::{source_id}"
             validity = "valid_positive" if preserved == 1 else ("invalid_negative" if preserved == 0 else "unlabeled")
             rows.append({
@@ -401,6 +435,8 @@ def build_mentions(df: pd.DataFrame, folds: pd.DataFrame, test_fold: str, inv: p
 
 
 def embed_texts(texts: list[str], model_name: str | None, device: str | None, batch_size: int) -> tuple[np.ndarray, str]:
+    if not texts:
+        return np.zeros((0, 1)), "none"
     if model_name:
         try:
             from sentence_transformers import SentenceTransformer
@@ -422,13 +458,18 @@ def agglomerative_labels(Z: np.ndarray, distance_threshold: float) -> np.ndarray
         return AgglomerativeClustering(n_clusters=None, distance_threshold=distance_threshold, affinity="cosine", linkage="average").fit_predict(Z)
 
 
+def entropy_from_counter(c: Counter[str]) -> float:
+    total = sum(c.values())
+    return -sum((n / total) * math.log2(n / total) for n in c.values()) if total else 0.0
+
+
 def induce_senses(all_mentions: pd.DataFrame, min_support: int, distance_threshold: float, embedding_model: str | None, device: str | None, batch_size: int) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     if all_mentions.empty:
         return pd.DataFrame(), pd.DataFrame(), {}
-    positive = all_mentions[(all_mentions["split"] == "train") & (all_mentions["roundtrip_meaning_preserved"] == 1)].copy()
+    positive = all_mentions[(all_mentions["split"] == "train") & (all_mentions["annotation_validity_status"] == "valid_positive")].copy()
     assigned = all_mentions.copy()
     assigned["source_element_sense_id"] = ""
-    metadata: dict[str, Any] = {"embedding_backends": Counter(), "n_source_elements": 0}
+    metadata: dict[str, Any] = {"embedding_backends": Counter(), "n_source_elements": 0, "positive_sense_seed_rule": "train split AND annotation_validity_status == valid_positive"}
 
     for source_key, gpos in positive.groupby("source_element_key"):
         metadata["n_source_elements"] += 1
@@ -475,7 +516,7 @@ def induce_senses(all_mentions: pd.DataFrame, min_support: int, distance_thresho
 
     assigned = assigned[assigned["source_element_sense_id"].astype(str).ne("")].copy()
     nodes = []
-    train_pos = assigned[(assigned["split"] == "train") & (assigned["roundtrip_meaning_preserved"] == 1)]
+    train_pos = assigned[(assigned["split"] == "train") & (assigned["annotation_validity_status"] == "valid_positive")]
     for sid, g in train_pos.groupby("source_element_sense_id"):
         role_counts = Counter(g["role_signature"].astype(str))
         polarity_counts = Counter(g["linguistic_polarity"].astype(str))
@@ -501,11 +542,6 @@ def induce_senses(all_mentions: pd.DataFrame, min_support: int, distance_thresho
         })
     metadata["embedding_backends"] = dict(metadata["embedding_backends"])
     return assigned, pd.DataFrame(nodes), metadata
-
-
-def entropy_from_counter(c: Counter[str]) -> float:
-    total = sum(c.values())
-    return -sum((n / total) * math.log2(n / total) for n in c.values()) if total else 0.0
 
 
 def span_relation(a: pd.Series, b: pd.Series) -> tuple[bool, bool, bool, float, float]:
@@ -541,20 +577,24 @@ def build_pair_features(mentions: pd.DataFrame, nodes: pd.DataFrame, embedding_m
     if mentions.empty or nodes.empty:
         return pd.DataFrame(), "none"
     train = mentions[mentions["split"] == "train"].copy()
-    pos = train[train["roundtrip_meaning_preserved"] == 1].copy()
+    pos = train[train["annotation_validity_status"] == "valid_positive"].copy()
     node_emb, backend = node_embeddings(nodes, pos, embedding_model, device, batch_size)
     node_ids = sorted(nodes["source_element_sense_id"].astype(str).unique())
     node_counts = pos.groupby("source_element_sense_id")["sentence_context_id"].nunique().to_dict()
     n_contexts = max(1, pos["sentence_context_id"].nunique())
     stats: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {
         "same_span_count": 0, "overlap_count": 0, "nested_span_count": 0,
-        "same_sentence_cooccurrence": 0, "positive_preserved_support": 0, "negative_failure_support": 0,
-        "proximity_sum": 0.0, "distances": [], "span_sims": [], "forms": set(),
+        "same_sentence_cooccurrence": 0, "within_information_model_cooccurrence": 0,
+        "cross_information_model_cooccurrence": 0, "within_llm_cooccurrence": 0, "cross_llm_cooccurrence": 0,
+        "same_sentence_same_model_same_llm_count": 0, "same_sentence_cross_model_same_llm_count": 0,
+        "same_sentence_same_model_cross_llm_count": 0, "same_sentence_cross_model_cross_llm_count": 0,
+        "positive_preserved_support": 0, "negative_failure_support": 0,
+        "proximity_sum": 0.0, "distances": [], "span_sims": [], "forms": set(), "sentences": set(),
         "information_models": set(), "llms": set(), "cross_model_contexts": 0, "cross_llm_contexts": 0,
         "role_pairs": Counter(), "span_pairs": [],
     })
     for context_id, g0 in train.groupby("sentence_context_id"):
-        g = g0.drop_duplicates(subset=["source_element_sense_id", "span_start", "span_end", "information_model", "llm", "roundtrip_meaning_preserved"])
+        g = g0.drop_duplicates(subset=["source_element_sense_id", "span_start", "span_end", "information_model", "llm", "annotation_validity_status"])
         for ra, rb in combinations(g.to_dict("records"), 2):
             a, b = pd.Series(ra), pd.Series(rb)
             s1, s2 = sorted([str(a["source_element_sense_id"]), str(b["source_element_sense_id"])])
@@ -562,11 +602,21 @@ def build_pair_features(mentions: pd.DataFrame, nodes: pd.DataFrame, embedding_m
                 continue
             d = stats[(s1, s2)]
             same, overlap, nested, dist, prox = span_relation(a, b)
-            both_pos = int(a["roundtrip_meaning_preserved"]) == 1 and int(b["roundtrip_meaning_preserved"]) == 1
-            any_neg = int(a["roundtrip_meaning_preserved"]) == 0 or int(b["roundtrip_meaning_preserved"]) == 0
+            both_pos = str(a["annotation_validity_status"]) == "valid_positive" and str(b["annotation_validity_status"]) == "valid_positive"
+            any_neg = str(a["annotation_validity_status"]) == "invalid_negative" or str(b["annotation_validity_status"]) == "invalid_negative"
+            same_model = str(a["information_model"]) == str(b["information_model"])
+            same_llm = str(a["llm"]) == str(b["llm"])
             if both_pos:
                 d["same_sentence_cooccurrence"] += 1
                 d["positive_preserved_support"] += 1
+                d["within_information_model_cooccurrence"] += int(same_model)
+                d["cross_information_model_cooccurrence"] += int(not same_model)
+                d["within_llm_cooccurrence"] += int(same_llm)
+                d["cross_llm_cooccurrence"] += int(not same_llm)
+                d["same_sentence_same_model_same_llm_count"] += int(same_model and same_llm)
+                d["same_sentence_cross_model_same_llm_count"] += int((not same_model) and same_llm)
+                d["same_sentence_same_model_cross_llm_count"] += int(same_model and (not same_llm))
+                d["same_sentence_cross_model_cross_llm_count"] += int((not same_model) and (not same_llm))
                 d["same_span_count"] += int(same)
                 d["overlap_count"] += int(overlap)
                 d["nested_span_count"] += int(nested)
@@ -575,10 +625,11 @@ def build_pair_features(mentions: pd.DataFrame, nodes: pd.DataFrame, embedding_m
                     d["distances"].append(dist)
                 d["span_sims"].append(jaccard_text(str(a["span_text"]), str(b["span_text"])))
                 d["forms"].add(str(a["form_id"]))
+                d["sentences"].add(str(a["sentence_context_id"]))
                 d["information_models"].update([str(a["information_model"]), str(b["information_model"])])
                 d["llms"].update([str(a["llm"]), str(b["llm"])])
-                d["cross_model_contexts"] += int(str(a["information_model"]) != str(b["information_model"]))
-                d["cross_llm_contexts"] += int(str(a["llm"]) != str(b["llm"]))
+                d["cross_model_contexts"] += int(not same_model)
+                d["cross_llm_contexts"] += int(not same_llm)
                 d["role_pairs"][(str(a["role_signature"]), str(b["role_signature"]))] += 1
                 if len(d["span_pairs"]) < 8:
                     d["span_pairs"].append(f"{a['span_text']} || {b['span_text']}")
@@ -600,6 +651,8 @@ def build_pair_features(mentions: pd.DataFrame, nodes: pd.DataFrame, embedding_m
         mean_span_sim = float(np.mean(d["span_sims"])) if d["span_sims"] else 0.0
         role1 = norm(node_map.get(s1, {}).get("dominant_role_signature"))
         role2 = norm(node_map.get(s2, {}).get("dominant_role_signature"))
+        role_entropy_1 = float(node_map.get(s1, {}).get("role_signature_entropy", 0) or 0)
+        role_entropy_2 = float(node_map.get(s2, {}).get("role_signature_entropy", 0) or 0)
         role_compatible = role1 == role2 and role1 not in {"", "other"}
         rows.append({
             "sense_id_1": s1, "sense_id_2": s2,
@@ -607,6 +660,14 @@ def build_pair_features(mentions: pd.DataFrame, nodes: pd.DataFrame, embedding_m
             "overlap_count": d["overlap_count"],
             "nested_span_count": d["nested_span_count"],
             "same_sentence_cooccurrence": cooc,
+            "within_information_model_cooccurrence": d["within_information_model_cooccurrence"],
+            "cross_information_model_cooccurrence": d["cross_information_model_cooccurrence"],
+            "within_llm_cooccurrence": d["within_llm_cooccurrence"],
+            "cross_llm_cooccurrence": d["cross_llm_cooccurrence"],
+            "same_sentence_same_model_same_llm_count": d["same_sentence_same_model_same_llm_count"],
+            "same_sentence_cross_model_same_llm_count": d["same_sentence_cross_model_same_llm_count"],
+            "same_sentence_same_model_cross_llm_count": d["same_sentence_same_model_cross_llm_count"],
+            "same_sentence_cross_model_cross_llm_count": d["same_sentence_cross_model_cross_llm_count"],
             "proximity_weighted_cooccurrence": round(float(d["proximity_sum"]), 6),
             "mean_token_distance": mean_dist,
             "cross_model_support": len([x for x in d["information_models"] if x]),
@@ -614,6 +675,7 @@ def build_pair_features(mentions: pd.DataFrame, nodes: pd.DataFrame, embedding_m
             "cross_model_contexts": d["cross_model_contexts"],
             "cross_llm_contexts": d["cross_llm_contexts"],
             "form_support": len(d["forms"]),
+            "sentence_support": len(d["sentences"]),
             "span_text_similarity": round(mean_span_sim, 6),
             "embedding_similarity": round(emb_sim, 6),
             "pmi": round(pmi, 6),
@@ -622,6 +684,8 @@ def build_pair_features(mentions: pd.DataFrame, nodes: pd.DataFrame, embedding_m
             "negative_failure_support": d["negative_failure_support"],
             "dominant_role_1": role1,
             "dominant_role_2": role2,
+            "role_entropy_1": round(role_entropy_1, 6),
+            "role_entropy_2": round(role_entropy_2, 6),
             "role_signature_compatible": role_compatible,
             "role_pair_counts_json": json.dumps({f"{a}|{b}": n for (a, b), n in d["role_pairs"].items()}, ensure_ascii=False),
             "example_span_pairs_json": json.dumps(d["span_pairs"], ensure_ascii=False),
@@ -643,50 +707,61 @@ def type_relationships(features: pd.DataFrame, args: argparse.Namespace) -> pd.D
         emb = float(r["embedding_similarity"])
         span_sim = float(r["span_text_similarity"])
         prox = float(r["proximity_weighted_cooccurrence"])
-        mean_dist = r["mean_token_distance"]
+        form_support = int(r.get("form_support", 0))
+        sentence_support = int(r.get("sentence_support", 0))
         compatible = bool(r["role_signature_compatible"])
         role1, role2 = norm(r["dominant_role_1"]), norm(r["dominant_role_2"])
         role_conflict = role1 != role2 and role1 not in {"", "other"} and role2 not in {"", "other"}
+        entropy_high = max(float(r.get("role_entropy_1", 0) or 0), float(r.get("role_entropy_2", 0) or 0)) >= args.unsafe_role_entropy_threshold
+        negative_ratio = neg / max(1, pos + neg)
+        recurrent = form_support >= args.min_pair_form_support and sentence_support >= args.min_pair_sentence_support and pos >= args.min_positive_pair_support
+        cross_supported = int(r.get("cross_model_support", 0)) > 1 or int(r.get("cross_llm_support", 0)) > 1
         relationship = "related_context_only"
         reasons = []
 
         if role_conflict and (same > 0 or overlap > 0 or emb >= args.unsafe_similarity_threshold):
             relationship = "unsafe_to_merge"
-            reasons.append("mixed functional role signatures")
-        elif same >= args.min_same_span_support and pos >= args.min_positive_pair_support and emb >= args.near_equivalence_embedding_threshold and compatible:
+            reasons.append("high overlap/similarity with conflicting actor/action/resource/purpose/time/privacy roles")
+        elif entropy_high and emb >= args.unsafe_similarity_threshold and not compatible:
+            relationship = "unsafe_to_merge"
+            reasons.append("broad/high-entropy role signature with high semantic similarity")
+        elif recurrent and negative_ratio <= args.max_negative_support_ratio and compatible and same >= args.min_same_span_support and emb >= args.near_equivalence_embedding_threshold:
             relationship = "near_equivalent"
-            reasons.append("recurrent same-span support with compatible roles")
-        elif overlap >= args.min_overlap_support and span_sim >= args.near_equivalence_span_threshold and pos >= args.min_positive_pair_support and compatible:
+            reasons.append("recurrent same-span evidence, compatible roles, and high embedding similarity")
+            if cross_supported:
+                reasons.append("cross-information-model or cross-LLM support")
+        elif recurrent and negative_ratio <= args.max_negative_support_ratio and compatible and overlap >= args.min_overlap_support and span_sim >= args.near_equivalence_span_threshold:
             relationship = "near_equivalent"
-            reasons.append("recurrent overlapping spans with high lexical similarity")
-        elif nested >= args.min_nested_support and pos >= args.min_positive_pair_support:
+            reasons.append("recurrent overlapping spans with high lexical similarity and compatible roles")
+            if cross_supported:
+                reasons.append("cross-information-model or cross-LLM support")
+        elif nested >= args.min_nested_support and recurrent:
             relationship = "broader_narrower"
-            reasons.append("recurrent nested spans")
+            reasons.append("recurrent nested spans / lexical containment pattern")
         elif cooc >= args.min_complementary_support and prox >= args.min_proximity_weight and overlap == 0 and role_conflict:
             relationship = "complementary"
-            reasons.append("recurrent proximal co-occurrence with distinct roles")
-        elif cooc == 0 and emb >= args.unsafe_similarity_threshold and role_conflict:
-            relationship = "unsafe_to_merge"
-            reasons.append("semantic similarity conflicts with functional role signatures")
+            reasons.append("recurrent proximal co-occurrence with distinct local roles")
         elif cooc > 0:
-            reasons.append("contextual co-occurrence without merge evidence")
+            reasons.append("same-sentence context without enough merge evidence")
         else:
-            reasons.append("insufficient relational evidence")
+            reasons.append("insufficient recurrence/co-occurrence/overlap evidence")
 
         confidence = 0.0
         if relationship == "near_equivalent":
-            confidence = min(1.0, 0.25 * same + 0.15 * overlap + 0.25 * emb + 0.20 * span_sim + 0.05 * int(r["cross_model_support"]) + 0.05 * int(r["cross_llm_support"]))
+            confidence = min(1.0, 0.20 * same + 0.15 * overlap + 0.22 * emb + 0.18 * span_sim + 0.08 * int(cross_supported) + 0.05 * math.log1p(form_support) + 0.05 * math.log1p(sentence_support) - 0.15 * negative_ratio)
         elif relationship == "broader_narrower":
-            confidence = min(1.0, nested / max(1, pos) + 0.25 * span_sim)
+            confidence = min(1.0, nested / max(1, pos) + 0.20 * span_sim + 0.05 * math.log1p(form_support))
         elif relationship == "complementary":
-            confidence = min(1.0, prox / max(1, cooc) + 0.1 * math.log1p(cooc))
+            confidence = min(1.0, prox / max(1, cooc) + 0.1 * math.log1p(cooc) + 0.05 * int(role_conflict))
         elif relationship == "unsafe_to_merge":
-            confidence = min(1.0, 0.5 + 0.25 * emb + 0.1 * math.log1p(overlap + same))
+            confidence = min(1.0, 0.5 + 0.25 * emb + 0.1 * math.log1p(overlap + same) + 0.1 * int(entropy_high))
         x = r.to_dict()
         x["relationship_type"] = relationship
         x["relationship_confidence"] = round(confidence, 6)
         x["relationship_reason"] = "; ".join(reasons)
-        x["negative_support_ratio"] = round(neg / max(1, pos + neg), 6)
+        x["negative_support_ratio"] = round(negative_ratio, 6)
+        x["recurrence_condition_met"] = bool(recurrent)
+        x["cross_model_or_llm_support_met"] = bool(cross_supported)
         rows.append(x)
     return pd.DataFrame(rows)
 
@@ -694,11 +769,13 @@ def type_relationships(features: pd.DataFrame, args: argparse.Namespace) -> pd.D
 class UnionFind:
     def __init__(self):
         self.parent: dict[str, str] = {}
+
     def find(self, x: str) -> str:
         self.parent.setdefault(x, x)
         if self.parent[x] != x:
             self.parent[x] = self.find(self.parent[x])
         return self.parent[x]
+
     def union(self, a: str, b: str) -> None:
         ra, rb = self.find(a), self.find(b)
         if ra != rb:
@@ -769,11 +846,11 @@ def run_fold(args: argparse.Namespace) -> None:
     mentions, excluded = build_mentions(df, folds, args.fold_id, inv)
     mentions.to_csv(out / "annotation_evidence_mentions_all.csv", index=False)
     excluded.to_csv(out / "annotation_exclusion_audit.csv", index=False)
-    valid_train = mentions[(mentions["split"] == "train") & (mentions["roundtrip_meaning_preserved"] == 1)].copy()
+    valid_train = mentions[(mentions.get("split", pd.Series(dtype=str)) == "train") & (mentions.get("annotation_validity_status", pd.Series(dtype=str)) == "valid_positive")].copy() if not mentions.empty else pd.DataFrame()
     valid_train.to_csv(out / "annotation_evidence_mentions_valid_train.csv", index=False)
-    invalid_train = mentions[(mentions["split"] == "train") & (mentions["roundtrip_meaning_preserved"] == 0)].copy()
+    invalid_train = mentions[(mentions.get("split", pd.Series(dtype=str)) == "train") & (mentions.get("annotation_validity_status", pd.Series(dtype=str)) == "invalid_negative")].copy() if not mentions.empty else pd.DataFrame()
     invalid_train.to_csv(out / "annotation_evidence_mentions_invalid_train_audit.csv", index=False)
-    test = mentions[mentions["split"] == "test"].copy()
+    test = mentions[mentions.get("split", pd.Series(dtype=str)) == "test"].copy() if not mentions.empty else pd.DataFrame()
     test.to_csv(out / "annotation_evidence_mentions_test_provenance_only.csv", index=False)
 
     sense_mentions, nodes, sense_meta = induce_senses(
@@ -781,15 +858,22 @@ def run_fold(args: argparse.Namespace) -> None:
         args.embedding_model or None, args.embedding_device or None, args.batch_size,
     )
     sense_mentions.to_csv(out / "source_element_sense_mentions_all.csv", index=False)
-    sense_mentions[(sense_mentions["split"] == "train") & (sense_mentions["roundtrip_meaning_preserved"] == 1)].to_csv(out / "source_element_sense_mentions_valid_train.csv", index=False)
+    if not sense_mentions.empty:
+        sense_mentions[(sense_mentions["split"] == "train") & (sense_mentions["annotation_validity_status"] == "valid_positive")].to_csv(out / "source_element_sense_mentions_valid_train.csv", index=False)
+    else:
+        pd.DataFrame().to_csv(out / "source_element_sense_mentions_valid_train.csv", index=False)
     nodes.to_csv(out / "source_element_sense_nodes.csv", index=False)
 
     pair_features, pair_backend = build_pair_features(sense_mentions, nodes, args.embedding_model or None, args.embedding_device or None, args.batch_size)
     pair_features.to_csv(out / "pairwise_evidence_features.csv", index=False)
     relationships = type_relationships(pair_features, args)
     relationships.to_csv(out / "typed_relationship_edges.csv", index=False)
-    relationships[relationships["relationship_type"] == "complementary"].to_csv(out / "provision_bundle_edges.csv", index=False)
-    relationships[relationships["relationship_type"] == "unsafe_to_merge"].to_csv(out / "unsafe_merge_edges.csv", index=False)
+    if not relationships.empty:
+        relationships[relationships["relationship_type"] == "complementary"].to_csv(out / "provision_bundle_edges.csv", index=False)
+        relationships[relationships["relationship_type"] == "unsafe_to_merge"].to_csv(out / "unsafe_merge_edges.csv", index=False)
+    else:
+        pd.DataFrame().to_csv(out / "provision_bundle_edges.csv", index=False)
+        pd.DataFrame().to_csv(out / "unsafe_merge_edges.csv", index=False)
 
     clusters = build_equivalence_clusters(nodes, relationships, args)
     clusters.to_csv(out / "seed_concept_clusters.csv", index=False)
@@ -799,7 +883,9 @@ def run_fold(args: argparse.Namespace) -> None:
         "n_valid_train_mentions": int(len(valid_train)),
         "n_invalid_train_mentions": int(len(invalid_train)),
         "n_test_mentions_provenance_only": int(len(test)),
-        "n_excluded_annotation_items": int(len(excluded)),
+        "n_excluded_annotation_or_row_items": int(len(excluded)),
+        "n_positive_preserved_but_solely_na_llm_tags": int((excluded.get("reason", pd.Series(dtype=str)) == "positive_preserved_but_solely_na_llm_tags").sum()) if not excluded.empty else 0,
+        "n_positive_preserved_but_no_valid_span_annotations": int((excluded.get("reason", pd.Series(dtype=str)) == "positive_preserved_but_no_valid_span_annotations").sum()) if not excluded.empty else 0,
         "n_sense_nodes": int(len(nodes)),
         "n_pairwise_features": int(len(pair_features)),
         "n_near_equivalent_edges": int((relationships.get("relationship_type", pd.Series(dtype=str)) == "near_equivalent").sum()),
@@ -808,7 +894,21 @@ def run_fold(args: argparse.Namespace) -> None:
         "n_seed_clusters": int(len(clusters)),
         "sense_induction": sense_meta,
         "pair_embedding_backend": pair_backend,
-        "human_validity_rule": "Only annotations from rows with human meaning_preserved == 1 are valid induction evidence.",
+        "human_validity_rule": "Only non-NA span-level annotations from rows with human meaning_preserved == 1 are valid induction evidence; rows with solely NA tags are excluded even when meaning_preserved == 1.",
+        "negative_support_rule": "Negative rows with valid tags are retained only as failure-support audit and do not seed sense nodes or fields.",
+        "cooccurrence_signal_columns": [
+            "within_information_model_cooccurrence", "cross_information_model_cooccurrence",
+            "within_llm_cooccurrence", "cross_llm_cooccurrence",
+            "same_sentence_same_model_same_llm_count", "same_sentence_cross_model_same_llm_count",
+            "same_sentence_same_model_cross_llm_count", "same_sentence_cross_model_cross_llm_count",
+        ],
+        "relationship_typing_rules": {
+            "near_equivalent": "requires recurrent positive-preserved support, compatible roles, same-span/overlap evidence, and high lexical/embedding similarity; cross-model/cross-LLM support boosts confidence",
+            "complementary": "requires recurrent proximal co-occurrence, low/no span overlap, and distinct role signatures",
+            "broader_narrower": "requires recurrent nested spans / lexical containment signal",
+            "related_context_only": "same-sentence context without enough merge evidence",
+            "unsafe_to_merge": "conflicting role signatures or high-entropy broad hubs with high overlap/similarity",
+        },
         "cluster_rule": "Only typed near_equivalent edges may merge source-element-sense nodes.",
         "bundle_rule": "Complementary/proximity edges are retained separately and never used for equivalence clustering.",
     }
@@ -863,11 +963,15 @@ def main() -> None:
     p.add_argument("--min_overlap_support", type=int, default=2)
     p.add_argument("--min_nested_support", type=int, default=2)
     p.add_argument("--min_positive_pair_support", type=int, default=2)
+    p.add_argument("--min_pair_form_support", type=int, default=1)
+    p.add_argument("--min_pair_sentence_support", type=int, default=1)
     p.add_argument("--min_complementary_support", type=int, default=2)
     p.add_argument("--min_proximity_weight", type=float, default=0.75)
     p.add_argument("--near_equivalence_embedding_threshold", type=float, default=0.72)
     p.add_argument("--near_equivalence_span_threshold", type=float, default=0.70)
     p.add_argument("--unsafe_similarity_threshold", type=float, default=0.68)
+    p.add_argument("--unsafe_role_entropy_threshold", type=float, default=1.25)
+    p.add_argument("--max_negative_support_ratio", type=float, default=0.50)
     p.add_argument("--min_equivalence_confidence", type=float, default=0.55)
 
     p = sub.add_parser("summarize-folds")
