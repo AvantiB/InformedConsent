@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-"""Compile corrected baseline and direct-schema roundtrip outputs for scoring.
+"""Compile corrected baseline and schema-strategy roundtrip outputs for scoring.
 
 This script produces one classifier-ready standardized_roundtrips.csv from:
 
 - corrected Union V0 output directories;
 - corrected individual source-model output directories;
-- direct LLM schema evaluation roundtrip_rows.csv files.
+- reduced-schema evaluation roundtrip_rows.csv files from direct or data-driven
+  schema arms.
 
 It intentionally only compiles completed round-trip outputs. Scoring is still done
 with 09_score_roundtrip_outputs.py so all conditions use the same classifier and
@@ -43,7 +44,6 @@ def split_paths_or_globs(x: str) -> list[Path]:
             out.extend(Path(m) for m in matches)
         else:
             out.append(Path(part))
-    # de-duplicate preserving order
     seen = set()
     unique = []
     for p in out:
@@ -64,23 +64,35 @@ def load_standardizer_module():
     return mod
 
 
-def standardize_direct_csv(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def infer_schema_family(schema_id: str, path: Path) -> tuple[str, str]:
+    sid = schema_id.casefold()
+    p = str(path).casefold()
+    if "data_driven" in sid or "data_driven" in p:
+        return "data_driven_llm", "data_driven_llm_reduced_schema"
+    if "direct" in sid or "direct" in p:
+        return "direct_llm", "direct_llm_reduced_schema"
+    return "reduced_schema", "reduced_schema"
+
+
+def standardize_schema_csv(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     df = pd.read_csv(path).fillna("")
     rows: list[dict[str, Any]] = []
     audit: list[dict[str, Any]] = []
     if df.empty:
-        audit.append({"output_dir": str(path.parent), "condition": "direct_llm_schema", "llm": "", "information_model": "direct_llm_reduced_schema", "n_standardized": 0})
+        family, info = infer_schema_family("", path)
+        audit.append({"output_dir": str(path.parent), "condition": f"{family}_schema", "llm": "", "information_model": info, "n_standardized": 0})
         return rows, audit
 
     for i, r in df.iterrows():
         llm = norm(r.get("llm")) or "unknown"
         gran = norm(r.get("schema_granularity")) or "unknown_granularity"
         schema_id = norm(r.get("schema_id"))
+        family, information_model = infer_schema_family(schema_id, path)
         fold_id = norm(r.get("schema_fold_id"))
-        source_id = norm(r.get("source_sentence_id")) or norm(r.get("eval_row_id")) or f"direct_row_{i:06d}"
+        source_id = norm(r.get("source_sentence_id")) or norm(r.get("eval_row_id")) or f"schema_row_{i:06d}"
         original = norm(r.get("original_sentence") or r.get("original_text") or r.get("source_text"))
         reconstructed = norm(r.get("reconstructed_sentence") or r.get("reconstructed_text"))
-        condition = f"direct_llm_{gran}"
+        condition = f"{family}_{gran}"
         annotation_count = r.get("n_valid_annotations", "")
         try:
             annotation_count = int(annotation_count)
@@ -110,11 +122,12 @@ def standardize_direct_csv(path: Path) -> tuple[list[dict[str, Any]], list[dict[
             "llm": llm,
             "model": llm,
             "condition": condition,
-            "information_model": "direct_llm_reduced_schema",
-            "info_model": "direct_llm_reduced_schema",
+            "information_model": information_model,
+            "info_model": information_model,
             "schema_id": schema_id,
             "schema_fold_id": fold_id,
             "schema_granularity": gran,
+            "schema_family": family,
             "annotation_count": annotation_count,
             "unique_element_count": unique_count,
             "forward_parse_ok": bool(r.get("forward_parse_ok", True)),
@@ -123,11 +136,12 @@ def standardize_direct_csv(path: Path) -> tuple[list[dict[str, Any]], list[dict[
             "has_backward": True,
             "output_dir": str(path.parent),
         })
+    family0, info0 = infer_schema_family(norm(df.get("schema_id", pd.Series([""])).iloc[0]) if "schema_id" in df else "", path)
     audit.append({
         "output_dir": str(path.parent),
-        "condition": "direct_llm_schema",
+        "condition": f"{family0}_schema",
         "llm": norm(df.get("llm", pd.Series([""])).iloc[0]) if "llm" in df else "",
-        "information_model": "direct_llm_reduced_schema",
+        "information_model": info0,
         "schema_granularity": norm(df.get("schema_granularity", pd.Series([""])).iloc[0]) if "schema_granularity" in df else "",
         "schema_fold_id": norm(df.get("schema_fold_id", pd.Series([""])).iloc[0]) if "schema_fold_id" in df else "",
         "n_standardized": len(rows),
@@ -140,7 +154,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--union_model_dirs", default="", help="Comma-separated dirs/globs for corrected Union V0 model dirs.")
     ap.add_argument("--individual_model_dirs", default="", help="Comma-separated dirs/globs for corrected individual model dirs.")
-    ap.add_argument("--direct_roundtrip_csvs", default="", help="Comma-separated files/globs for direct schema roundtrip_rows.csv files.")
+    ap.add_argument("--schema_roundtrip_csvs", default="", help="Comma-separated files/globs for direct/data-driven schema roundtrip_rows.csv files.")
+    ap.add_argument("--direct_roundtrip_csvs", default="", help="Backward-compatible alias for --schema_roundtrip_csvs.")
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--require_backward", action="store_true", help="Drop rows with empty reconstructions.")
     args = ap.parse_args()
@@ -160,8 +175,9 @@ def main() -> None:
         rows.extend(r)
         audit.extend(a)
         missing.extend(m)
-    for p in split_paths_or_globs(args.direct_roundtrip_csvs):
-        r, a = standardize_direct_csv(p)
+    schema_csvs = ",".join([x for x in [args.schema_roundtrip_csvs, args.direct_roundtrip_csvs] if x])
+    for p in split_paths_or_globs(schema_csvs):
+        r, a = standardize_schema_csv(p)
         rows.extend(r)
         audit.extend(a)
 
@@ -177,7 +193,7 @@ def main() -> None:
         "n_rows": int(len(df)),
         "union_model_dirs": [str(p) for p in split_paths_or_globs(args.union_model_dirs)],
         "individual_model_dirs": [str(p) for p in split_paths_or_globs(args.individual_model_dirs)],
-        "direct_roundtrip_csvs": [str(p) for p in split_paths_or_globs(args.direct_roundtrip_csvs)],
+        "schema_roundtrip_csvs": [str(p) for p in split_paths_or_globs(schema_csvs)],
         "require_backward": bool(args.require_backward),
     }
     (out / "compile_metadata.json").write_text(json.dumps(metadata, indent=2))
